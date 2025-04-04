@@ -1,4 +1,3 @@
-
 """
 M2_CAM_CRF - 使用全连接CRF对CAM进行后处理以生成二值掩码
 
@@ -12,6 +11,7 @@ import cv2
 from pathlib import Path
 import pydensecrf.densecrf as dcrf
 from pydensecrf.utils import unary_from_softmax
+from config import CRF_CONFIG, CAM_DIR, PSEUDO_MASK_DIR, IMAGE_DIR
 
 def load_cam(cam_path):
     """
@@ -105,14 +105,7 @@ def apply_crf(image, cam, config=None):
         numpy.ndarray: 形状为(H, W)的二值掩码，值为0或1
     """
     if config is None:
-        config = {
-            'pos_w': 3,       # 位置权重
-            'pos_xy_std': 3,  # 位置核标准差
-            'bi_w': 4,        # 双边权重
-            'bi_xy_std': 67,  # 双边空间标准差
-            'bi_rgb_std': 3,  # 双边颜色标准差
-            'iterations': 5   # 推理迭代次数
-        }
+        config = CRF_CONFIG
     
     # 如果需要，将图像转换为uint8
     if image.dtype != np.uint8:
@@ -267,24 +260,15 @@ def main():
     主函数，使用CRF处理所有CAM文件并生成二值掩码。
     """
     # 设置路径
-    cam_dir = "outputs/cams"
-    image_dir = "data/images"
-    output_dir = "outputs/pseudo_masks"
+    cam_dir = str(CAM_DIR)
+    image_dir = str(IMAGE_DIR)
+    output_dir = str(PSEUDO_MASK_DIR)
     
     # 如果输出目录不存在，则创建
     os.makedirs(output_dir, exist_ok=True)
     
-
-    crf_config = {
-        'pos_w': 3,         # 标准位置权重
-        'pos_xy_std': 5,    # 位置标准差，用于更好的空间一致性
-        'bi_w': 7,          # 双边权重，用于更好的边缘附着
-        'bi_xy_std': 80,    # 更大的空间标准差，用于更好的区域连贯性
-        'bi_rgb_std': 13,   # 更高的颜色标准差，以更容忍颜色变化
-        'iterations': 10    # 增加迭代次数，以实现更好的收敛
-    }
-    
-    # 获取所有CAM文件
+    # 处理每个CAM文件
+    success_count = 0
     cam_files = [f for f in Path(cam_dir).glob("*.npy")]
     
     if not cam_files:
@@ -294,9 +278,8 @@ def main():
     print(f"Found {len(cam_files)} CAM files")
     
     # 处理每个CAM文件
-    success_count = 0
     for cam_file in cam_files:
-        if process_cam_with_crf(cam_file, image_dir, output_dir, crf_config):
+        if process_cam_with_crf(cam_file, image_dir, output_dir, CRF_CONFIG):
             success_count += 1
     
     print(f"Processing completed. Successfully processed {success_count}/{len(cam_files)} files.")

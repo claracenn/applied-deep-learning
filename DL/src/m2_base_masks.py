@@ -12,6 +12,7 @@ import numpy as np
 import cv2
 from pathlib import Path
 import argparse
+from config import BASE_MASK_CONFIG, CAM_DIR, SEGMENTATION_DIR
 
 def load_cam(cam_path):
     """
@@ -171,11 +172,11 @@ def main():
     """
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='Generate binary masks from CAMs without CRF')
-    parser.add_argument('--cam_dir', type=str, default='outputs/cams', help='Directory containing CAM .npy files')
-    parser.add_argument('--output_dir', type=str, default='outputs/base_pseudo', help='Directory to save output masks')
-    parser.add_argument('--threshold', type=float, default=0.5, help='Threshold for binary mask generation')
-    parser.add_argument('--adaptive', action='store_true', help='Use adaptive (Otsu) thresholding')
-    parser.add_argument('--morph_size', type=int, default=5, help='Kernel size for morphological operations')
+    parser.add_argument('--cam_dir', type=str, default=str(CAM_DIR), help='Directory containing CAM .npy files')
+    parser.add_argument('--output_dir', type=str, default=str(SEGMENTATION_DIR), help='Directory to save output masks')
+    parser.add_argument('--threshold', type=float, default=BASE_MASK_CONFIG["threshold"], help='Threshold for binary mask generation')
+    parser.add_argument('--adaptive', action='store_true', default=BASE_MASK_CONFIG["adaptive_threshold"], help='Use adaptive (Otsu) thresholding')
+    parser.add_argument('--morph_size', type=int, default=BASE_MASK_CONFIG["morph_kernel_size"], help='Kernel size for morphological operations')
     args = parser.parse_args()
     
     # 设置路径
