@@ -51,6 +51,23 @@ CAM_CONFIG = {
     "body_expansion_factor": 1.3       # 身体区域扩展系数
 }
 
+# 基础掩码生成参数
+BASE_MASK_CONFIG = {
+    "threshold": 0.5,                  # 阈值，用于分离前景和背景
+    "adaptive_threshold": True,        # 是否使用自适应阈值
+    "morph_kernel_size": 5             # 形态学操作的核大小
+}
+
+# CRF后处理参数
+CRF_CONFIG = {
+    "pos_w": 3,                        # 标准位置权重
+    "pos_xy_std": 5,                   # 位置标准差，用于更好的空间一致性
+    "bi_w": 7,                         # 双边权重，用于更好的边缘附着
+    "bi_xy_std": 80,                   # 更大的空间标准差，用于更好的区域连贯性
+    "bi_rgb_std": 13,                  # 更高的颜色标准差，以更容忍颜色变化
+    "iterations": 10                    # 迭代次数，以实现更好的收敛
+}
+
 # 分类器训练参数
 CLASSIFIER_CONFIG = {
     "backbone": "resnet18",      # 使用的骨干网络

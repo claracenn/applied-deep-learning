@@ -27,9 +27,11 @@ class CAMModel(nn.Module):
         if backbone == "resnet18":
             base_model = models.resnet18(weights='IMAGENET1K_V1' if pretrained else None)
             self.feature_dim = 512  # ResNet18最后一层特征维度
+            print(f"使用模型: ResNet18 {'(带预训练权重)' if pretrained else '(不使用预训练权重)'}")
         else:
             base_model = models.resnet50(weights='IMAGENET1K_V1' if pretrained else None)
             self.feature_dim = 2048  # ResNet50最后一层特征维度
+            print(f"使用模型: ResNet50 {'(带预训练权重)' if pretrained else '(不使用预训练权重)'}")
         
         # 提取多尺度特征 (保留中间层特征)
         self.layer1 = nn.Sequential(*list(base_model.children())[:5])  # 浅层特征
@@ -173,7 +175,6 @@ class CAMExtractor:
         """
         self.config = config if config is not None else CLASSIFIER_CONFIG
         self.device = torch.device(self.config['device'])
-        self.model_path = Path(CLASSIFIER_DIR) / 'cam_model.pth'
         
         # 创建CAM模型
         self.model = CAMModel(num_classes=self.config['num_classes'], 
@@ -608,7 +609,7 @@ def train_classifier_and_extract_cams(train_ratio=0.8, val_ratio=0.1, test_ratio
     )
     
     # 检查是否需要训练或加载模型
-    model_path = Path(CLASSIFIER_DIR) / 'cam_model.pth'
+    model_path = Path(CLASSIFIER_DIR) / 'classifier_model.pth'
     if model_path.exists():
         print(f"Loading existing model: {model_path}")
         cam_extractor.load_model(model_path)
