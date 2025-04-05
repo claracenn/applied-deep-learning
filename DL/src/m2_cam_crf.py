@@ -7,7 +7,7 @@ M2_CAM_CRF - 使用全连接CRF对CAM进行后处理以生成二值掩码
 
 import os
 import numpy as np
-import cv2
+from PIL import Image, ImageFilter
 from pathlib import Path
 import pydensecrf.densecrf as dcrf
 from pydensecrf.utils import unary_from_softmax
@@ -92,6 +92,50 @@ def get_image_path(cam_filename, image_dir):
     
     return None
 
+def numpy_otsu_threshold(image):
+    """
+    使用纯numpy实现Otsu阈值
+    
+    参数:
+        image: 灰度图像数组
+        
+    返回:
+        float: Otsu阈值
+    """
+    # 计算图像直方图
+    hist, bin_edges = np.histogram(image.ravel(), bins=256, range=(0, 256))
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # 类别权重
+    w1 = np.cumsum(hist)
+    w2 = np.cumsum(hist[::-1])[::-1]
+    
+    # 类别均值
+    mean1 = np.cumsum(hist * bin_centers) / w1
+    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / w2[::-1])[::-1]
+    
+    # 类间方差
+    variance = w1[:-1] * w2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    
+    # 找到最大类间方差对应的阈值
+    idx = np.argmax(variance)
+    threshold = bin_centers[idx]
+    
+    return threshold
+
+def gray_to_rgb(gray_image):
+    """
+    将灰度图像转换为RGB图像
+    
+    参数:
+        gray_image: 灰度图像数组
+        
+    返回:
+        numpy.ndarray: RGB图像数组
+    """
+    rgb = np.stack([gray_image, gray_image, gray_image], axis=2)
+    return rgb
+
 def apply_crf(image, cam, config=None):
     """
     应用全连接条件随机场(CRF)来优化CAM。
@@ -111,9 +155,9 @@ def apply_crf(image, cam, config=None):
     if image.dtype != np.uint8:
         image = (image * 255).astype(np.uint8)
     
-    # 如果需要，将灰度图转换为BGR
+    # 如果需要，将灰度图转换为RGB
     if len(image.shape) == 2:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        image = gray_to_rgb(image)
     
     # 获取图像尺寸
     h, w = image.shape[:2]
@@ -143,19 +187,22 @@ def apply_crf(image, cam, config=None):
     print(f"Target shape for resize: ({w}, {h})")
     
     try:
-        # 尝试调整CAM大小以匹配图像尺寸
-        cam_resized = cv2.resize(cam.astype(np.float32), (w, h))
-    except cv2.error as e:
-        print(f"OpenCV resize error: {e}")
-        print(f"Attempting alternative method to resize")
-        # 使用另一种OpenCV调整大小的方法
-        cam_float32 = cam.astype(np.float32)
-        cam_resized = cv2.resize(cam_float32, (w, h), interpolation=cv2.INTER_LINEAR)
+        # 使用PIL调整CAM大小以匹配图像尺寸
+        cam_img = Image.fromarray(cam.astype(np.float32))
+        cam_resized_img = cam_img.resize((w, h), Image.BILINEAR)
+        cam_resized = np.array(cam_resized_img)
+    except Exception as e:
+        print(f"Resize error: {e}")
+        print(f"Attempting simple resize method")
+        # 使用简单的numpy插值
+        y_indices = np.linspace(0, cam.shape[0]-1, h).astype(np.int32)
+        x_indices = np.linspace(0, cam.shape[1]-1, w).astype(np.int32)
+        cam_resized = cam[y_indices[:, np.newaxis], x_indices]
     
     # 使用Otsu方法进行简单阈值处理
     cam_uint8 = (cam_resized * 255).astype(np.uint8)
-    _, otsu_mask = cv2.threshold(cam_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    otsu_threshold = otsu_mask.astype(float) / 255.0
+    otsu_threshold = numpy_otsu_threshold(cam_uint8)
+    otsu_mask = (cam_uint8 > otsu_threshold).astype(float)
     
     # 将阈值化CAM转换为概率图（软化边界）
     fg_prob = np.zeros_like(cam_resized)
@@ -199,8 +246,14 @@ def apply_crf(image, cam, config=None):
     MAP = np.argmax(Q, axis=0).reshape((h, w))
     
     # 简单的后处理 - 基本闭合操作以填充小洞
-    kernel = np.ones((5, 5), np.uint8)
-    MAP = cv2.morphologyEx(MAP.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    # 使用PIL进行形态学操作
+    map_img = Image.fromarray(MAP.astype(np.uint8) * 255)
+    # 闭运算：先膨胀后腐蚀，填充小洞
+    map_img = map_img.filter(ImageFilter.MinFilter(5))
+    map_img = map_img.filter(ImageFilter.MaxFilter(5))
+    
+    # 转回numpy数组
+    MAP = np.array(map_img) > 0
     
     return MAP.astype(np.uint8)
 
@@ -236,7 +289,7 @@ def process_cam_with_crf(cam_path, image_dir, output_dir, crf_config=None):
         return False
     
     # 加载原始图像
-    image = cv2.imread(str(image_path))
+    image = np.array(Image.open(str(image_path)))
     if image is None:
         print(f"Warning: Cannot load image {image_path}")
         return False
@@ -247,7 +300,9 @@ def process_cam_with_crf(cam_path, image_dir, output_dir, crf_config=None):
         
         # 保存结果
         output_path = Path(output_dir) / f"{base_name}.png"
-        cv2.imwrite(str(output_path), (mask * 255).astype(np.uint8))
+        # 使用PIL保存图像
+        mask_img = Image.fromarray((mask * 255).astype(np.uint8))
+        mask_img.save(str(output_path))
         
         print(f"Processed: {base_name}")
         return True

@@ -9,7 +9,7 @@ M2_BASE_MASKS - 直接使用CAM生成二值掩码（不使用CRF后处理）
 
 import os
 import numpy as np
-import cv2
+from PIL import Image, ImageFilter
 from pathlib import Path
 import argparse
 from config import BASE_MASK_CONFIG, CAM_DIR, SEGMENTATION_DIR
@@ -87,11 +87,48 @@ def apply_simple_threshold(cam, threshold=0.5, morph_kernel_size=5):
     # 应用阈值
     binary_mask = (cam > threshold).astype(np.uint8)
     
-    # 应用形态学操作以填充小空洞并平滑边缘
-    kernel = np.ones((morph_kernel_size, morph_kernel_size), np.uint8)
-    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+    # 将numpy数组转为PIL图像以应用形态学操作
+    img = Image.fromarray(binary_mask * 255)
     
-    return binary_mask
+    # 应用闭运算以填充小空洞并平滑边缘 - 使用PIL的过滤器
+    img = img.filter(ImageFilter.MinFilter(morph_kernel_size))
+    img = img.filter(ImageFilter.MaxFilter(morph_kernel_size))
+    
+    # 转回numpy数组并确保是二值的
+    binary_mask = np.array(img) > 0
+    
+    return binary_mask.astype(np.uint8)
+
+def numpy_otsu_threshold(image):
+    """
+    使用纯numpy实现Otsu阈值
+    
+    参数:
+        image: 灰度图像数组
+        
+    返回:
+        float: Otsu阈值
+    """
+    # 计算图像直方图
+    hist, bin_edges = np.histogram(image.ravel(), bins=256, range=(0, 256))
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # 类别权重
+    w1 = np.cumsum(hist)
+    w2 = np.cumsum(hist[::-1])[::-1]
+    
+    # 类别均值
+    mean1 = np.cumsum(hist * bin_centers) / w1
+    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / w2[::-1])[::-1]
+    
+    # 类间方差
+    variance = w1[:-1] * w2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    
+    # 找到最大类间方差对应的阈值
+    idx = np.argmax(variance)
+    threshold = bin_centers[idx]
+    
+    return threshold
 
 def process_cam_to_mask(cam_path, output_dir, threshold=0.5, adaptive_threshold=True, morph_kernel_size=5):
     """
@@ -124,8 +161,9 @@ def process_cam_to_mask(cam_path, output_dir, threshold=0.5, adaptive_threshold=
         if adaptive_threshold:
             # 将CAM转换为uint8以用于Otsu阈值
             cam_uint8 = (cam * 255).astype(np.uint8)
-            otsu_threshold, _ = cv2.threshold(cam_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            threshold = otsu_threshold / 255.0  # 转换回[0,1]范围
+            # 使用自定义的numpy Otsu阈值
+            otsu_threshold = numpy_otsu_threshold(cam_uint8) / 255.0
+            threshold = otsu_threshold  # 转换回[0,1]范围
             print(f"Using adaptive threshold: {threshold:.3f}")
         
         # 应用阈值处理
@@ -149,10 +187,12 @@ def process_cam_to_mask(cam_path, output_dir, threshold=0.5, adaptive_threshold=
             binary_mask = (binary_mask > 0).astype(np.uint8)
         
         # 将二值掩码保存为具有标准前景值(255)的PNG
-        cv2.imwrite(str(output_path), (binary_mask * 255).astype(np.uint8))
+        # 使用PIL
+        img = Image.fromarray((binary_mask * 255).astype(np.uint8))
+        img.save(str(output_path))
         
         # 验证掩码是否正确保存
-        saved_mask = cv2.imread(str(output_path), cv2.IMREAD_GRAYSCALE)
+        saved_mask = np.array(Image.open(str(output_path)).convert('L'))
         if saved_mask is not None:
             saved_unique = np.unique(saved_mask)
             print(f"Saved mask values: {saved_unique}")

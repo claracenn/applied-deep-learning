@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 import torch
-import cv2
 
 # 项目路径
 PROJECT_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,7 +40,7 @@ CAM_CONFIG = {
     "canny_high": 100,                 # Canny高阈值
     "use_adaptive_threshold": True,   # 是否使用自适应阈值
     "use_morphology": True,            # 是否使用形态学操作
-    "colormap": cv2.COLORMAP_JET,      # 热图颜色映射
+    "colormap": None,                  # 热图颜色映射，移除cv2引用
     "overlay_alpha": 0.7,              # 热图透明度
     "multi_scale_fusion": True,        # 是否使用多尺度特征融合
     "morphology_kernel_size": 5,       # 形态学核大小
