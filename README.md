@@ -27,10 +27,8 @@ pip install -r requirements.txt
 
 requirements.txt包含以下依赖:
 
-- opencv-python==4.8.0.76
 - scikit-learn==1.3.0
 - pydensecrf (GitHub版本)
-- numpy==1.26.0
 
 ## 项目结构
 
