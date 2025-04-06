@@ -90,6 +90,19 @@ CLASSIFIER_CONFIG = {
     "non_blocking": True         # 是否使用非阻塞数据传输
 }
 
+# ScoreNet training parameters
+SCORNET_CONFIG = {
+    "epochs": 20,
+    "lr": 0.001,
+    "batch_size": 8,
+    "patience": 5,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "save_path": "models/scorenet/scorenet.pth",
+    "input_size": (224, 224),
+    "image_dir": "data/images",
+    "cam_dir": "outputs/cams"
+}
+
 FAST_TEST_CONFIG = {
     "enabled": False, 
     "max_samples": 50,  # 最大样本数量
