@@ -615,7 +615,7 @@ class CAMExtractor:
         print(f"Loaded model from {model_path}")
 
 def get_enhanced_dataloaders(
-    image_dir, batch_size, seed=42, config=None
+    image_dir, batch_size, test_ratio=0.2, seed=42, config=None
 ):
     """
     创建数据加载器，包含增强的数据预处理，使用官方数据集划分
@@ -623,7 +623,8 @@ def get_enhanced_dataloaders(
     参数:
         image_dir: 图像目录路径
         batch_size: 批量大小
-        seed: 随机种子
+        test_ratio: 从test.txt中选取的比例作为测试集
+        seed: 随机种子，用于控制测试集选择的可重现性
         config: 配置字典，包含优化参数
         
     返回:
@@ -638,6 +639,7 @@ def get_enhanced_dataloaders(
     train_loader, test_loader = get_dataloaders_from_split(
         image_dir=image_dir,
         batch_size=batch_size,
+        test_ratio=test_ratio,
         seed=seed,
         config=config
     )
@@ -664,12 +666,13 @@ def train_classifier_and_extract_cams(seed=42, skip_train_eval=False, skip_cam_g
     # 创建CAM提取器
     cam_extractor = CAMExtractor(config) 
 
-    # 创建数据加载器
+    # 创建数据加载器，使用官方数据集划分
     print("Using official dataset split...")
-    from utils import get_dataloaders_from_split
+    # test_ratio=0.2 表示从test.txt中选择20%的数据作为测试集
     train_loader, test_loader = get_dataloaders_from_split(
         image_dir=IMAGE_DIR,
         batch_size=config["batch_size"],
+        test_ratio=0.2,  # 从test.txt中选择20%作为测试集
         seed=seed,
         config=config
     )
@@ -681,10 +684,14 @@ def train_classifier_and_extract_cams(seed=42, skip_train_eval=False, skip_cam_g
         cam_extractor.load_model(model_path)
     else:
         print("Training new model")
-        # 从训练集中分出一部分作为验证集来监控训练
+        # 从训练集中分出一小部分作为验证集来监控训练
+        # 注意：这里的划分是在trainval.txt的数据上进行的，与test.txt的20%测试集无关
         train_dataset = train_loader.dataset
-        train_size = int(0.9 * len(train_dataset))
+        val_ratio = 0.1  # 使用10%的训练数据作为验证集
+        train_size = int((1 - val_ratio) * len(train_dataset))
         val_size = len(train_dataset) - train_size
+        
+        print(f"Splitting training data: {train_size} for training, {val_size} for validation")
         train_subset, val_subset = random_split(
             train_dataset, 
             [train_size, val_size],
@@ -714,7 +721,7 @@ def train_classifier_and_extract_cams(seed=42, skip_train_eval=False, skip_cam_g
         # 使用分割后的训练集和验证集进行训练
         cam_extractor.train(train_subset_loader, val_subset_loader)
     
-    # 评估测试集
+    # 评估测试集（这是从test.txt中选出的20%数据）
     print("Evaluating test set performance...")
     test_acc = cam_extractor.evaluate(test_loader)
     print(f"Test set accuracy: {test_acc:.2f}%")
@@ -723,7 +730,7 @@ def train_classifier_and_extract_cams(seed=42, skip_train_eval=False, skip_cam_g
         print("Skipping train set evaluation to save time...")
     else:
         try:
-            # 对训练集进行评估
+            # 对训练集进行评估（这是trainval.txt中的所有数据）
             print("Evaluating train set...")
             train_acc = cam_extractor.evaluate(train_loader)
             print(f"Train set accuracy: {train_acc:.2f}%")
@@ -738,7 +745,7 @@ def train_classifier_and_extract_cams(seed=42, skip_train_eval=False, skip_cam_g
     # 生成CAM
     print("Starting CAM generation...")
     try:
-        # 只为训练集生成CAM
+        # 只为训练集生成CAM（使用trainval.txt中的所有数据）
         print("Processing training dataset only...")
         cam_extractor.generate_cams(train_loader)
         print(f"CAMs saved to {CAM_DIR}")

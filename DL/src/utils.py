@@ -129,18 +129,19 @@ class PetDataset(Dataset):
             'image_path': str(img_path)
         }
 
-def get_dataloaders(image_dir, batch_size=32, train_ratio=0.8, val_ratio=0.0, test_ratio=0.2, seed=42, config=None):
+def get_dataloaders(image_dir, batch_size=32, test_ratio=0.2, seed=42, config=None):
     """
-    创建数据加载器，始终使用官方数据集划分
+    创建数据加载器，使用官方数据集划分，从test.txt中选择一部分作为测试集
     
     参数:
         image_dir: 图像目录路径
         batch_size: 批量大小
-        train_ratio, val_ratio, test_ratio, seed: 不再使用，仅为保持接口兼容
+        test_ratio: 从test.txt中选取的比例作为测试集
+        seed: 随机种子，用于控制测试集选择的可重现性
         config: 配置字典，包含优化参数
     
     返回:
-        tuple: (train_loader, None, test_loader) - 第二个返回值为None，保持接口兼容
+        tuple: (train_loader, test_loader)
     """
     # 确保配置有效
     if config is None:
@@ -151,12 +152,12 @@ def get_dataloaders(image_dir, batch_size=32, train_ratio=0.8, val_ratio=0.0, te
     train_loader, test_loader = get_dataloaders_from_split(
         image_dir=image_dir,
         batch_size=batch_size,
+        test_ratio=test_ratio,
         seed=seed,
         config=config
     )
     
-    # 返回第二个元素为None，保持接口兼容
-    return train_loader, None, test_loader
+    return train_loader, test_loader
 
 def visualize_cam(image, cam, save_path=None, alpha=0.5):
     try:
@@ -306,14 +307,15 @@ def load_dataset_split():
         'test_labels': test_labels
     }
 
-def get_dataloaders_from_split(image_dir, batch_size=32, seed=42, config=None):
+def get_dataloaders_from_split(image_dir, batch_size=32, test_ratio=0.2, seed=42, config=None):
     """
-    根据官方数据集划分创建数据加载器，只包含训练集和测试集
+    根据官方数据集划分创建数据加载器，从test.txt中选择一部分作为测试集
     
     参数:
         image_dir: 图像目录路径
         batch_size: 批量大小
-        seed: 随机种子
+        test_ratio: 从test.txt中选取的比例作为测试集
+        seed: 随机种子，用于控制测试集选择的可重现性
         config: 配置字典，包含优化参数
     
     返回:
@@ -326,19 +328,6 @@ def get_dataloaders_from_split(image_dir, batch_size=32, seed=42, config=None):
     
     # 获取数据集划分
     splits = load_dataset_split()
-    if splits is None:
-        print("Warning: Using random split instead of official split")
-        # 使用8:2的分割
-        train_loader, _, test_loader = get_dataloaders(
-            image_dir=image_dir, 
-            batch_size=batch_size,
-            train_ratio=0.8,
-            val_ratio=0,
-            test_ratio=0.2,
-            seed=seed,
-            config=config
-        )
-        return train_loader, test_loader
     
     # 提取数据加载优化参数
     num_workers = config.get('num_workers', 4)
@@ -356,7 +345,13 @@ def get_dataloaders_from_split(image_dir, batch_size=32, seed=42, config=None):
     
     # 创建训练集和测试集的图像路径列表
     train_paths = [image_dict[img_id] for img_id in splits['train_ids'] if img_id in image_dict]
-    test_paths = [image_dict[img_id] for img_id in splits['test_ids'] if img_id in image_dict]
+    
+    # 从test.txt中随机选择test_ratio比例的样本作为测试集
+    random.seed(seed)  # 设置随机种子以确保可重现性
+    test_ids = splits['test_ids']
+    test_size = int(len(test_ids) * test_ratio)
+    selected_test_ids = random.sample(test_ids, test_size)
+    test_paths = [image_dict[img_id] for img_id in selected_test_ids if img_id in image_dict]
     
     # 创建训练集和测试集
     train_dataset = PetDataset(image_dir, transform=transform, labels_dict=splits['train_labels'])

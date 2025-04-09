@@ -594,8 +594,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
     # 日志字典
     log = {
         "train_loss": [],
-        "test_miou": [],
+        "test_loss": [],
         "train_miou": [],
+        "val_miou": [],  # 添加验证集mIoU
+        "test_miou": [],
         "mask_type": mask_type,
         "config": {k: v for k, v in config.__dict__.items() if not k.startswith('__')}
     }
@@ -603,9 +605,34 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
     best_miou = 0.0
     start_time = time.time()
     
+    # 从训练集中分出一小部分作为验证集
+    train_size = int(0.9 * len(train_loader.dataset))
+    val_size = len(train_loader.dataset) - train_size
+    train_subset, val_subset = random_split(
+        train_loader.dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(config.seed if hasattr(config, 'seed') else 42)
+    )
+    
+    # 创建验证集数据加载器
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=train_loader.batch_size,
+        shuffle=False,
+        num_workers=train_loader.num_workers
+    )
+    
+    # 使用剩余的训练数据创建新的训练加载器
+    train_subset_loader = DataLoader(
+        train_subset,
+        batch_size=train_loader.batch_size,
+        shuffle=True,
+        num_workers=train_loader.num_workers
+    )
+    
     # 检查首个批次是否有前景类
     try:
-        check_labels_batch = next(iter(train_loader))
+        check_labels_batch = next(iter(train_subset_loader))
         all_masks = check_labels_batch["mask"]
         
         # 检查批次大小是否为0
@@ -628,7 +655,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
         return model, log
     except Exception as e:
         print(f"Error checking batch: {e}")
-        # 继续执行
     
     # 使用带权重的损失函数处理不平衡类别
     if config.num_classes == 2:
@@ -647,9 +673,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
         train_loss = 0.0
         
         print(f"Epoch {epoch+1}/{config.num_epochs}")
-        total_batches = len(train_loader)
+        total_batches = len(train_subset_loader)
         
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_subset_loader):
             # 每隔一些批次打印进度
             if batch_idx % 10 == 0 or batch_idx == total_batches - 1:
                 print_progress(batch_idx + 1, total_batches, prefix='Training:', 
@@ -673,22 +699,27 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
             train_loss += loss.item()
         
         # 计算平均训练损失
-        train_loss /= len(train_loader)
+        train_loss /= len(train_subset_loader)
         log["train_loss"].append(train_loss)
         
         # 定期评估模型
         if (epoch + 1) % config.eval_every == 0:
+            # 在训练集上评估
+            train_miou, train_iou_per_class = compute_miou(model, train_subset_loader, device, config.num_classes)
+            log["train_miou"].append(train_miou)
+            
+            # 在验证集上评估
+            val_miou, val_iou_per_class = compute_miou(model, val_loader, device, config.num_classes)
+            log["val_miou"].append(val_miou)
+            
             # 在测试集上评估
             test_miou, test_iou_per_class = compute_miou(model, test_loader, device, config.num_classes)
             log["test_miou"].append(test_miou)
             
-            # 在训练集上评估
-            train_miou, train_iou_per_class = compute_miou(model, train_loader, device, config.num_classes)
-            log["train_miou"].append(train_miou)
-            
             print(f"Epoch {epoch+1}/{config.num_epochs}, "
                   f"Train Loss: {train_loss:.4f}, "
                   f"Train mIoU: {train_miou:.4f}, "
+                  f"Val mIoU: {val_miou:.4f}, "
                   f"Test mIoU: {test_miou:.4f}")
             
             # 添加每个类别的IoU到日志
@@ -698,15 +729,15 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
                     class_ious[f"class_{i}_iou"] = float(test_iou_per_class[i])
                 print(f"Class IoU details: {class_ious}")
             
-            # 保存最佳模型
-            if test_miou > best_miou:
-                best_miou = test_miou
+            # 保存最佳模型（使用验证集mIoU作为指标）
+            if val_miou > best_miou:
+                best_miou = val_miou
                 model_path = model_dir / f"best_model_{mask_type}.pth"
                 torch.save(model.state_dict(), str(model_path))
-                print(f"Saving best model, mIoU: {best_miou:.4f}")
+                print(f"Saving best model, Val mIoU: {best_miou:.4f}")
             
-            # 使用学习率调度器
-            scheduler.step(test_miou)
+            # 使用验证集mIoU来调整学习率
+            scheduler.step(val_miou)
     
     # 保存训练日志
     training_time = time.time() - start_time
@@ -718,7 +749,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
     with open(log_path, 'w') as f:
         json.dump(log, f, indent=4)
     
-    print(f"Training completed in {training_time/60:.2f} minutes. Best mIoU: {best_miou:.4f}")
+    print(f"Training completed in {training_time/60:.2f} minutes. Best Val mIoU: {best_miou:.4f}")
     
     return model, log
 
@@ -988,8 +1019,10 @@ def main():
     # 打印结果对比
     print("\n===== Results =====")
     print(f"Base Pseudo Masks - Train mIoU: {results['base'].get('train_miou', 'N/A')}")
+    print(f"Base Pseudo Masks - Val mIoU: {results['base'].get('val_miou', 'N/A')}")
     print(f"Base Pseudo Masks - Test mIoU: {results['base'].get('test_miou', 'N/A')}")
     print(f"CRF Pseudo Masks - Train mIoU: {results['crf'].get('train_miou', 'N/A')}")
+    print(f"CRF Pseudo Masks - Val mIoU: {results['crf'].get('val_miou', 'N/A')}")
     print(f"CRF Pseudo Masks - Test mIoU: {results['crf'].get('test_miou', 'N/A')}")
     
     # 保存结果对比
@@ -997,16 +1030,24 @@ def main():
     result_dir = Path(config.result_dir)
     result_dir.mkdir(exist_ok=True, parents=True)
     
+    # 保存详细的JSON结果
     comparison_path = result_dir / f"comparison_results_{timestamp}.json"
     with open(comparison_path, 'w') as f:
         json.dump(results, f, indent=4)
     
-    # 保存CSV格式结果
+    # 保存CSV格式结果，包含训练集、验证集和测试集的mIoU
     csv_path = result_dir / f"miou_comparison_{timestamp}.csv"
     with open(csv_path, 'w') as f:
-        f.write("train mIoU,train+CRF mIoU,test mIoU,test+CRF mIoU\n")
-        f.write(f"{results['base'].get('train_miou', 0):.4f},{results['crf'].get('train_miou', 0):.4f}," +
-                f"{results['base'].get('test_miou', 0):.4f},{results['crf'].get('test_miou', 0):.4f}\n")
+        # 写入表头
+        f.write("Method,Train_mIoU,Val_mIoU,Test_mIoU\n")
+        # 写入基础方法结果
+        f.write(f"Base,{results['base'].get('train_miou', 0):.4f}," +
+                f"{results['base'].get('val_miou', 0):.4f}," +
+                f"{results['base'].get('test_miou', 0):.4f}\n")
+        # 写入CRF方法结果
+        f.write(f"CRF,{results['crf'].get('train_miou', 0):.4f}," +
+                f"{results['crf'].get('val_miou', 0):.4f}," +
+                f"{results['crf'].get('test_miou', 0):.4f}\n")
     
     print(f"Results comparison saved to {comparison_path}")
     print(f"mIoU comparison CSV saved to {csv_path}")
