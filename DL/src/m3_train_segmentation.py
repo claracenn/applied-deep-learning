@@ -1,4 +1,3 @@
-
 """
 M3_TRAIN_SEGMENTATION - 使用伪标签训练DeepLab-LargeFOV + ResNet50进行语义分割
 
@@ -6,9 +5,10 @@ M3_TRAIN_SEGMENTATION - 使用伪标签训练DeepLab-LargeFOV + ResNet50进行�
 并计算两种方法在训练集和验证集上的mIoU性能指标。
 
 输入:
-    - outputs/pseudo_masks/*.png: CRF后处理的伪标签
-    - outputs/base_pseudo/*.png: 不带CRF处理的伪标签
+    - outputs/pseudo_masks/*.png: CRF后处理的伪标签 (仅用于训练集)
+    - outputs/base_pseudo/*.png: 不带CRF处理的伪标签 (仅用于训练集)
     - data/images/: 原始图像数据集
+    - data/annotations/: 真实标签 (用于验证集)
 
 输出:
     - models/segmentor/: 保存训练好的模型
@@ -26,7 +26,7 @@ M3_TRAIN_SEGMENTATION - 使用伪标签训练DeepLab-LargeFOV + ResNet50进行�
 import os
 import time
 import numpy as np
-import cv2
+from PIL import Image, ImageOps
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,6 +37,25 @@ from pathlib import Path
 import argparse
 import json
 from datetime import datetime
+from scipy import ndimage
+import random
+
+# 导入配置文件
+from config import (
+    SEGMENTATION_CONFIG, 
+    SEGMENTATION_PATHS, 
+    PROJECT_ROOT, 
+    OUTPUT_ROOT,
+    MODEL_ROOT,
+    DATA_ROOT,
+    IMAGE_DIR,
+    ANNOTATION_DIR,
+    PSEUDO_MASK_DIR,
+    SEGMENTATION_DIR
+)
+
+# 导入utils中的分割函数
+from utils import set_seed, get_dataloaders
 
 # 设置随机种子，确保结果可复现
 def set_seed(seed=42):
@@ -51,29 +70,27 @@ def set_seed(seed=42):
 # 配置
 class SegmentationConfig:
     def __init__(self):
-        self.img_dir = "data/images"
-        self.base_mask_dir = "outputs/base_pseudo"
-        self.crf_mask_dir = "outputs/pseudo_masks"
-        self.model_dir = "models/segmentor"
-        self.result_dir = "outputs/results"
+        # 使用配置文件中的路径
+        self.img_dir = str(IMAGE_DIR)
+        self.base_mask_dir = str(SEGMENTATION_DIR)
+        self.crf_mask_dir = str(PSEUDO_MASK_DIR)
+        self.gt_mask_dir = str(ANNOTATION_DIR)
+        self.model_dir = str(MODEL_ROOT / "segmentor")
+        self.result_dir = str(OUTPUT_ROOT / "results")
         
-        # 模型配置
-        self.backbone = "resnet50"  # 只使用ResNet50
-        self.atrous_rates = (6, 12, 18, 24)  # 空洞卷积率
-        self.num_classes = 2  # 背景和前景
+        # 从配置文件加载其他设置
+        self.backbone = SEGMENTATION_CONFIG["backbone"]
+        self.atrous_rates = SEGMENTATION_CONFIG["atrous_rates"]
+        self.num_classes = SEGMENTATION_CONFIG["num_classes"]
+        self.batch_size = SEGMENTATION_CONFIG["batch_size"]
+        self.num_epochs = SEGMENTATION_CONFIG["num_epochs"]
+        self.learning_rate = SEGMENTATION_CONFIG["learning_rate"]
+        self.weight_decay = SEGMENTATION_CONFIG["weight_decay"]
+        self.image_size = SEGMENTATION_CONFIG["image_size"]
+        self.save_every = SEGMENTATION_CONFIG["save_every"]
+        self.eval_every = SEGMENTATION_CONFIG["eval_every"]
         
-        # 训练配置
-        self.batch_size = 8
-        self.num_epochs = 5
-        self.learning_rate = 1e-4
-        self.weight_decay = 1e-4
-        self.train_ratio = 0.8
-        self.val_ratio = 0.2
-        self.image_size = (224, 224)  # (height, width)
-        
-        # 保存与输出配置
-        self.save_every = 5  # 每隔多少个epoch保存一次模型
-        self.eval_every = 1   # 每隔多少个epoch评估一次模型
+        # 设置设备 - 简单方式
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         # 快速模式配置
@@ -96,11 +113,12 @@ def print_progress(current, total, prefix='', suffix='', decimals=1, length=30, 
 
 # 数据集类
 class SegmentationDataset(Dataset):
-    def __init__(self, img_dir, mask_dir, transform=None, mask_transform=None):
+    def __init__(self, img_dir, mask_dir, transform=None, mask_transform=None, image_list=None):
         self.img_dir = Path(img_dir)
         self.mask_dir = Path(mask_dir)
         self.transform = transform
         self.mask_transform = mask_transform
+        self.image_list = image_list  # 指定的图像列表
         
         # 获取所有有对应掩码的图像
         self.image_paths = []
@@ -109,33 +127,53 @@ class SegmentationDataset(Dataset):
         # 支持的图像扩展名
         img_extensions = ['.jpg', '.jpeg', '.png']
         
-        # 首先获取所有掩码文件
-        mask_files = [f for f in os.listdir(mask_dir) if f.endswith('.png')]
-        
-        # 对于每个掩码，查找对应的图像
-        for mask_file in mask_files:
-            base_name = Path(mask_file).stem  # 去掉扩展名
+        # 如果提供了图像列表，则只使用列表中的图像
+        if image_list:
+            for img_name in image_list:
+                base_name = Path(img_name).stem  # 去掉扩展名和路径
+                
+                # 查找对应的掩码文件
+                mask_path = self.mask_dir / f"{base_name}.png"
+                if mask_path.exists():
+                    # 查找对应的图像文件
+                    for ext in img_extensions:
+                        img_path = self.img_dir / f"{base_name}{ext}"
+                        if img_path.exists():
+                            self.image_paths.append(img_path)
+                            self.mask_paths.append(mask_path)
+                            break
+        else:
+            # 检查mask_dir是否存在
+            if not self.mask_dir.exists():
+                raise FileNotFoundError(f"掩码目录不存在: {self.mask_dir}")
+                
+            # 首先获取所有掩码文件
+            mask_files = [f for f in self.mask_dir.glob('*.png')]
             
-            # 查找对应的图像文件
-            for ext in img_extensions:
-                img_path = self.img_dir / f"{base_name}{ext}"
-                if img_path.exists():
-                    self.image_paths.append(img_path)
-                    self.mask_paths.append(self.mask_dir / mask_file)
-                    break
+            # 对于每个掩码，查找对应的图像
+            for mask_path in mask_files:
+                base_name = mask_path.stem  # 去掉扩展名
+                
+                # 查找对应的图像文件
+                for ext in img_extensions:
+                    img_path = self.img_dir / f"{base_name}{ext}"
+                    if img_path.exists():
+                        self.image_paths.append(img_path)
+                        self.mask_paths.append(mask_path)
+                        break
         
         # 预先验证图像，移除无效的图像
         valid_indices = []
         for i, (img_path, mask_path) in enumerate(zip(self.image_paths, self.mask_paths)):
             try:
-                # 尝试读取图像，确保它是有效的
-                img = cv2.imread(str(img_path))
+                # 使用PIL尝试读取图像，确保它是有效的
+                img = Image.open(str(img_path))
                 if img is None:
                     print(f"Warning: Cannot read image {img_path}, skipping")
                     continue
                 
                 # 尝试读取掩码，确保它是有效的
-                mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                mask = Image.open(str(mask_path))
                 if mask is None:
                     print(f"Warning: Cannot read mask {mask_path}, skipping")
                     continue
@@ -159,22 +197,17 @@ class SegmentationDataset(Dataset):
         mask_path = self.mask_paths[idx]
         
         try:
-            # 读取图像和掩码
-            image = cv2.imread(str(img_path))
-            if image is None:
-                raise ValueError(f"Cannot read image: {img_path}")
+            # 使用PIL读取图像和掩码
+            image = Image.open(str(img_path)).convert('RGB')
+            mask_img = Image.open(str(mask_path))
             
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # 如果掩码是彩色的，转换为灰度
+            if mask_img.mode != 'L':
+                mask_img = mask_img.convert('L')
             
-            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                # 尝试读取彩色图像并转换为灰度（处理CAM可视化图像）
-                mask_color = cv2.imread(str(mask_path))
-                if mask_color is not None:
-                    # 如果是彩色的CAM图像，转换为灰度
-                    mask = cv2.cvtColor(mask_color, cv2.COLOR_BGR2GRAY)
-                else:
-                    raise ValueError(f"Cannot read mask: {mask_path}")
+            # 转换为NumPy数组进行处理
+            image_np = np.array(image)
+            mask = np.array(mask_img)
             
             # 检查掩码是否为空，输出调试信息
             if idx < 5:  # 只对前几个样本打印调试信息
@@ -190,17 +223,17 @@ class SegmentationDataset(Dataset):
                 if idx < 5:
                     print(f"Mask {idx} might be a CAM heatmap (range: {mask.min()}-{mask.max()}, unique values: {len(unique_values)})")
                 
-                # 利用Otsu自适应阈值进行二值化
+                # 将掩码归一化到0-255范围
                 if mask.max() <= 1:  # 可能是0-1归一化的
                     mask = (mask * 255).astype(np.uint8)
                 
-                # 使用Otsu阈值法
-                _, binary_mask = cv2.threshold(mask, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                # 使用简单的阈值法，而不是Otsu
+                threshold = np.median(mask[mask > 0]) if np.any(mask > 0) else 127
+                binary_mask = (mask > threshold).astype(np.uint8)
                 
-                # 应用形态学操作以改善掩码质量
-                kernel = np.ones((3, 3), np.uint8)
-                binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
-                binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+                # 应用简单的形态学操作
+                binary_mask = ndimage.binary_opening(binary_mask, structure=np.ones((3,3))).astype(np.uint8)
+                binary_mask = ndimage.binary_closing(binary_mask, structure=np.ones((3,3))).astype(np.uint8)
                 
                 # 检查前景像素占比
                 foreground_ratio = np.mean(binary_mask) * 100
@@ -210,7 +243,7 @@ class SegmentationDataset(Dataset):
                 # 如果前景像素太少，可能需要降低阈值
                 if foreground_ratio < 1.0:  # 低于1%的前景
                     # 使用更低的固定阈值
-                    _, binary_mask = cv2.threshold(mask, mask.max() * 0.3, 1, cv2.THRESH_BINARY)
+                    binary_mask = (mask > mask.max() * 0.3).astype(np.uint8)
                     foreground_ratio = np.mean(binary_mask) * 100
                     if idx < 5:
                         print(f"After re-thresholding mask {idx}: foreground pixel ratio={foreground_ratio:.2f}%")
@@ -243,32 +276,29 @@ class SegmentationDataset(Dataset):
             
             # 应用变换
             if self.transform:
-                image = self.transform(image)
-            
-            if self.mask_transform:
-                # 不需要再执行squeeze操作，因为我们自定义的BinaryMaskToTensor已经返回了正确形状的张量
-                mask = self.mask_transform(mask)
-                # 确保掩码是2D张量
-                if mask.dim() > 2:
-                    mask = mask.squeeze()
+                # 将numpy数组转回PIL图像用于torchvision变换
+                image_pil = Image.fromarray(image_np)
+                image = self.transform(image_pil)
             else:
-                # 确保mask是二值的，且为long类型
+                # 手动转换为tensor
+                image = torch.from_numpy(image_np.transpose((2, 0, 1))).float() / 255.0
+            
+            # 处理掩码变换 - 修复版本
+            if self.mask_transform:
+                # 保证mask作为numpy数组传入mask_transform
+                mask_tensor = self.mask_transform(mask)
+                return {"image": image, "mask": mask_tensor, "path": str(img_path)}
+            else:
+                # 没有mask_transform时的直接转换
                 if mask.max() > 1:
                     mask = (mask > 127).astype(np.uint8)
-                mask = torch.from_numpy(mask).long()
-            
-            return {"image": image, "mask": mask, "path": str(img_path)}
+                mask_tensor = torch.from_numpy(mask).long()
+                return {"image": image, "mask": mask_tensor, "path": str(img_path)}
             
         except Exception as e:
             print(f"Error processing sample {idx}: {e}")
             # 返回一个替代样本（空图像和掩码）
-            # 这里创建一个与数据集中其他样本相同形状的空样本
-            if self.transform:
-                dummy_image = torch.zeros(3, *self.transform(np.zeros((224, 224, 3), dtype=np.uint8)).shape[1:])
-            else:
-                dummy_image = torch.zeros(3, 224, 224)
-                
-            # 创建一个224x224的2D掩码
+            dummy_image = torch.zeros(3, 224, 224)
             dummy_mask = torch.zeros((224, 224), dtype=torch.long)
             
             return {"image": dummy_image, "mask": dummy_mask, "path": str(img_path)}
@@ -288,31 +318,78 @@ def create_fast_mode_subset(dataset, num_samples):
 # 掩码变换 - 修复: 确保二值掩码在ToTensor后不会变成浮点数0
 class BinaryMaskToTensor:
     def __call__(self, mask):
-        # 确保掩码是二值的，值为0和1
-        if mask.max() > 1:
-            mask = (mask > 127).astype(np.uint8)
-        # 转换为张量，保持二值特性
-        # 注意: 添加通道维度以匹配Resize期望的格式
-        mask_tensor = torch.from_numpy(mask).long()
+        """
+        将掩码转换为PyTorch tensor，处理多种可能的输入类型
+        
+        Args:
+            mask: 可以是numpy数组或PyTorch tensor
+            
+        Returns:
+            torch.Tensor: 二值掩码，形状为 [1, H, W] 或 [H, W]
+        """
+        # 1. 检查输入类型
+        if isinstance(mask, torch.Tensor):
+            # 如果已经是张量，只需确保类型正确
+            mask_tensor = mask.long()
+        else:
+            # 确保掩码是二值的，值为0和1
+            if mask.max() > 1:
+                mask = (mask > 127).astype(np.uint8)
+            
+            # 转换为张量
+            mask_tensor = torch.from_numpy(mask).long()
+        
+        # 2. 确保维度正确
         if mask_tensor.dim() == 2:
-            mask_tensor = mask_tensor.unsqueeze(0) # 增加通道维度
-        return mask_tensor
+            # 有些操作需要通道维度
+            mask_tensor_with_channel = mask_tensor.unsqueeze(0)
+        else:
+            mask_tensor_with_channel = mask_tensor
+            
+        return mask_tensor_with_channel
 
 # 创建自定义的Resize转换，保持掩码值
 class MaskResize:
     def __init__(self, size):
         self.size = size
     
-    def __call__(self, mask_tensor):
-        # 使用最近邻插值进行缩放，保持掩码值
+    def __call__(self, mask):
+        """
+        对掩码进行缩放，保持掩码值，处理不同类型的输入
+        
+        Args:
+            mask: 可以是numpy数组或PyTorch tensor
+            
+        Returns:
+            torch.Tensor: 缩放后的二值掩码，形状为 [H, W]
+        """
+        # 1. 确保输入是PyTorch tensor
+        if isinstance(mask, np.ndarray):
+            mask_tensor = torch.from_numpy(mask).float()
+        else:
+            mask_tensor = mask.float()  # 确保是浮点类型用于插值
+        
+        # 2. 确保维度正确，需要[B, C, H, W]格式
+        if mask_tensor.dim() == 2:  # [H, W]
+            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        elif mask_tensor.dim() == 3:  # [C, H, W]
+            mask_tensor = mask_tensor.unsqueeze(0)  # [1, C, H, W]
+        
+        # 3. 使用最近邻插值进行缩放，保持掩码值
         resized = F.interpolate(
-            mask_tensor.float().unsqueeze(0),  # 添加批次维度
+            mask_tensor,
             size=self.size,
             mode='nearest'
         )
-        # 移除批次维度，确保移除通道维度
-        resized = resized.squeeze(0).squeeze(0).long()
-        return resized  # 应该是2D张量 [H, W]
+        
+        # 4. 移除多余的维度，确保输出是[H, W]
+        resized = resized.squeeze().long()  # 移除批次和通道维度
+        
+        # 如果只有一个像素，可能会挤压所有维度
+        if resized.dim() == 0:
+            resized = resized.unsqueeze(0).unsqueeze(0)  # 恢复为[1, 1]
+            
+        return resized  # 返回2D张量 [H, W]
 
 # DeepLab-LargeFOV + ResNet50 模型
 class DeepLabLargeFOV(nn.Module):
@@ -504,18 +581,20 @@ def compute_miou(model, dataloader, device, num_classes=2):
     return mean_iou, iou_per_class
 
 # 训练函数
-def train_model(model, train_loader, val_loader, criterion, optimizer, config, mask_type="base"):
+def train_model(model, train_loader, test_loader, criterion, optimizer, config, mask_type="base"):
     device = config.device
     model.to(device)
     
     # 创建结果目录
-    os.makedirs(config.model_dir, exist_ok=True)
-    os.makedirs(config.result_dir, exist_ok=True)
+    model_dir = Path(config.model_dir)
+    result_dir = Path(config.result_dir)
+    model_dir.mkdir(exist_ok=True, parents=True)
+    result_dir.mkdir(exist_ok=True, parents=True)
     
     # 日志字典
     log = {
         "train_loss": [],
-        "val_miou": [],
+        "test_miou": [],
         "train_miou": [],
         "mask_type": mask_type,
         "config": {k: v for k, v in config.__dict__.items() if not k.startswith('__')}
@@ -559,6 +638,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, config, m
     else:
         weighted_criterion = criterion
     
+    # 使用学习率调度器
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=2)
+    
     for epoch in range(config.num_epochs):
         # 训练阶段
         model.train()
@@ -596,9 +678,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, config, m
         
         # 定期评估模型
         if (epoch + 1) % config.eval_every == 0:
-            # 在验证集上评估
-            val_miou, val_iou_per_class = compute_miou(model, val_loader, device, config.num_classes)
-            log["val_miou"].append(val_miou)
+            # 在测试集上评估
+            test_miou, test_iou_per_class = compute_miou(model, test_loader, device, config.num_classes)
+            log["test_miou"].append(test_miou)
             
             # 在训练集上评估
             train_miou, train_iou_per_class = compute_miou(model, train_loader, device, config.num_classes)
@@ -607,21 +689,24 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, config, m
             print(f"Epoch {epoch+1}/{config.num_epochs}, "
                   f"Train Loss: {train_loss:.4f}, "
                   f"Train mIoU: {train_miou:.4f}, "
-                  f"Val mIoU: {val_miou:.4f}")
+                  f"Test mIoU: {test_miou:.4f}")
             
             # 添加每个类别的IoU到日志
             if epoch == 0 or (epoch + 1) % 5 == 0:  # 每5个epoch记录一次详细IoU
                 class_ious = {}
                 for i in range(config.num_classes):
-                    class_ious[f"class_{i}_iou"] = float(val_iou_per_class[i])
+                    class_ious[f"class_{i}_iou"] = float(test_iou_per_class[i])
                 print(f"Class IoU details: {class_ious}")
             
             # 保存最佳模型
-            if val_miou > best_miou:
-                best_miou = val_miou
-                torch.save(model.state_dict(), 
-                           os.path.join(config.model_dir, f"best_model_{mask_type}.pth"))
+            if test_miou > best_miou:
+                best_miou = test_miou
+                model_path = model_dir / f"best_model_{mask_type}.pth"
+                torch.save(model.state_dict(), str(model_path))
                 print(f"Saving best model, mIoU: {best_miou:.4f}")
+            
+            # 使用学习率调度器
+            scheduler.step(test_miou)
     
     # 保存训练日志
     training_time = time.time() - start_time
@@ -629,7 +714,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, config, m
     log["best_miou"] = best_miou
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(config.result_dir, f"training_log_{mask_type}_{timestamp}.json")
+    log_path = result_dir / f"training_log_{mask_type}_{timestamp}.json"
     with open(log_path, 'w') as f:
         json.dump(log, f, indent=4)
     
@@ -637,18 +722,113 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, config, m
     
     return model, log
 
+# 添加加载官方数据集划分的函数
+def load_official_dataset_split(trainval_file, test_file, test_ratio=0.2, seed=42):
+    """
+    从Oxford-IIIT Pet数据集官方划分文件加载训练和测试集，
+    从test.txt中随机选择test_ratio比例的样本作为测试集
+    
+    Args:
+        trainval_file: 训练集和验证集列表文件路径
+        test_file: 测试集列表文件路径
+        test_ratio: 从test.txt中选择的比例作为测试集
+        seed: 随机种子，确保测试集选择的可重现性
+        
+    Returns:
+        train_images, test_images: 训练集和测试集的图像名称列表
+    """
+    trainval_path = Path(trainval_file)
+    test_path = Path(test_file)
+    
+    if not trainval_path.exists() or not test_path.exists():
+        raise FileNotFoundError(f"Dataset split files not found: {trainval_path} or {test_path}")
+    
+    # 读取trainval.txt文件作为训练集
+    train_images = []
+    with open(trainval_path, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue  # 跳过注释和空行
+            parts = line.strip().split()
+            if parts:
+                # 格式: Image CLASS-ID SPECIES BREED ID
+                image_name = parts[0]
+                train_images.append(image_name)
+    
+    # 读取test.txt文件
+    all_test_images = []
+    with open(test_path, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue  # 跳过注释和空行
+            parts = line.strip().split()
+            if parts:
+                image_name = parts[0]
+                all_test_images.append(image_name)
+    
+    # 设置随机种子以确保可重现性
+    random.seed(seed)
+    
+    # 随机选择test_ratio比例的样本作为测试集
+    test_size = int(len(all_test_images) * test_ratio)
+    # 随机打乱后选择前test_size个
+    random.shuffle(all_test_images)
+    test_images = all_test_images[:test_size]
+    
+    print(f"Dataset split loaded: {len(train_images)} training images, {len(test_images)} test images")
+    print(f"Test set is {test_ratio*100:.1f}% of test.txt file, using random seed {seed}")
+    return train_images, test_images
+
 def main():
     parser = argparse.ArgumentParser(description='Train and evaluate segmentation models with different pseudo masks')
     parser.add_argument('--base_only', action='store_true', help='Only train and evaluate with base pseudo masks')
     parser.add_argument('--crf_only', action='store_true', help='Only train and evaluate with CRF pseudo masks')
     parser.add_argument('--fast_mode', action='store_true', help='Run in fast mode to verify model functionality')
-    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--epochs', type=int, default=SEGMENTATION_CONFIG["num_epochs"], help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=SEGMENTATION_CONFIG["batch_size"], help='Batch size for training')
+    parser.add_argument('--lr', type=float, default=SEGMENTATION_CONFIG["learning_rate"], help='Learning rate')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
+    parser.add_argument('--test_ratio', type=float, default=0.2, help='Ratio of test.txt to use as test set')
+    parser.add_argument('--num_workers', type=int, default=SEGMENTATION_CONFIG["num_workers"], help='Number of data loading workers')
     parser.add_argument('--crf_dir', type=str, default=None, help='Directory with CRF preset masks to use (e.g., outputs/pseudo_masks/preset_A)')
+    parser.add_argument('--trimap_dir', type=str, default=str(DATA_ROOT / 'annotations/trimaps'), help='真实标签(trimap)目录')
+    parser.add_argument('--trainval_file', type=str, default=str(DATA_ROOT / 'annotations/trainval.txt'), help='训练集列表文件')
+    parser.add_argument('--test_file', type=str, default=str(DATA_ROOT / 'annotations/test.txt'), help='测试集列表文件')
     args = parser.parse_args()
+    
+    # 确保所有必要的目录都存在
+    print("检查并创建必要的目录...")
+    for path in [
+        Path(SEGMENTATION_DIR),  # 基础伪标签
+        Path(PSEUDO_MASK_DIR),   # CRF处理后的伪标签
+        Path(MODEL_ROOT / "segmentor"),  # 模型保存目录
+        Path(OUTPUT_ROOT / "results"),   # 结果保存目录
+    ]:
+        if not path.exists():
+            print(f"创建目录: {path}")
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            print(f"目录已存在: {path}")
+    
+    # 检查真实标签目录
+    trimap_dir = Path(args.trimap_dir)
+    if not trimap_dir.exists() or not any(trimap_dir.glob('*.png')):
+        print(f"警告: 真实标签目录 {trimap_dir} 不存在或为空")
+    else:
+        print(f"找到真实标签目录: {trimap_dir}, 包含 {len(list(trimap_dir.glob('*.png')))} 个标签文件")
+    
+    # 检查伪标签目录是否包含PNG文件
+    base_masks = list(Path(SEGMENTATION_DIR).glob('*.png'))
+    crf_masks = list(Path(PSEUDO_MASK_DIR).glob('*.png'))
+    
+    print(f"基础伪标签数量: {len(base_masks)}")
+    print(f"CRF处理后伪标签数量: {len(crf_masks)}")
+    
+    if len(base_masks) == 0 and not args.crf_only:
+        print("警告: 基础伪标签目录为空，可能无法训练基础模型")
+    
+    if len(crf_masks) == 0 and not args.base_only:
+        print("警告: CRF处理后伪标签目录为空，可能无法训练CRF模型")
     
     # 设置随机种子
     set_seed(args.seed)
@@ -658,6 +838,7 @@ def main():
     config.num_epochs = args.epochs
     config.batch_size = args.batch_size
     config.learning_rate = args.lr
+    config.gt_mask_dir = args.trimap_dir  # 设置真实标签目录
     
     # 设置数据加载器线程数
     num_workers = 0 if args.fast_mode else args.num_workers  # 快速模式下使用0个worker以避免多进程问题
@@ -674,21 +855,23 @@ def main():
         config.eval_every = 1  # 每个epoch都评估
     
     # 使用指定的CRF预设掩码
-    if args.crf_dir and os.path.exists(args.crf_dir) and os.listdir(args.crf_dir):
+    if args.crf_dir and Path(args.crf_dir).exists() and any(Path(args.crf_dir).glob('*.png')):
         print(f"\n===== Using CRF preset masks from {args.crf_dir} =====")
         if not args.base_only:
             config.crf_mask_dir = args.crf_dir
             print(f"Will use CRF preset masks from: {args.crf_dir}")
     
     # 创建结果目录
-    os.makedirs(config.model_dir, exist_ok=True)
-    os.makedirs(config.result_dir, exist_ok=True)
+    Path(config.model_dir).mkdir(exist_ok=True, parents=True)
+    Path(config.result_dir).mkdir(exist_ok=True, parents=True)
     
     # 数据变换
     transform = transforms.Compose([
+        transforms.RandomResizedCrop(config.image_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.Resize(config.image_size)
     ])
     
     mask_transform = transforms.Compose([
@@ -696,98 +879,134 @@ def main():
         MaskResize(config.image_size)
     ])
     
+    # 使用官方数据集划分，从test.txt中选择一部分作为测试集
+    print("加载官方数据集划分...")
+    train_images, test_images = load_official_dataset_split(
+        args.trainval_file,
+        args.test_file,
+        test_ratio=args.test_ratio,
+        seed=args.seed
+    )
+    
     # 创建结果汇总
     results = {"base": {}, "crf": {}}
     
     # 训练使用基础掩码的模型
     if not args.crf_only:
         print("\n===== Training with base pseudo masks =====")
-        base_dataset = SegmentationDataset(config.img_dir, config.base_mask_dir, transform, mask_transform)
+        # 创建训练集 - 使用基础伪标签
+        train_dataset = SegmentationDataset(
+            config.img_dir, 
+            config.base_mask_dir, 
+            transform, 
+            mask_transform,
+            image_list=train_images  # 只使用训练集图像
+        )
+        
+        # 创建测试集 - 使用真实标签
+        test_dataset = SegmentationDataset(
+            config.img_dir, 
+            config.gt_mask_dir,  # 使用真实标签(trimaps)
+            transform, 
+            mask_transform,
+            image_list=test_images  # 只使用测试集图像
+        )
         
         # 快速模式下只使用少量样本
         if config.fast_mode:
-            base_dataset = create_fast_mode_subset(base_dataset, config.fast_samples)
-            print(f"Fast mode: Using {len(base_dataset)} samples from base pseudo masks")
-        
-        # 分割为训练集和验证集
-        train_size = int(config.train_ratio * len(base_dataset))
-        val_size = len(base_dataset) - train_size
-        train_dataset, val_dataset = random_split(base_dataset, [train_size, val_size])
+            train_dataset = create_fast_mode_subset(train_dataset, config.fast_samples)
+            test_dataset = create_fast_mode_subset(test_dataset, config.fast_samples // 5)
+            print(f"Fast mode: Using {len(train_dataset)} samples for training and {len(test_dataset)} for testing")
         
         train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=num_workers)
-        val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=num_workers)
+        test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=num_workers)
         
         # 创建模型、损失函数和优化器
         model_base = DeepLabLargeFOV(num_classes=config.num_classes, atrous_rates=config.atrous_rates, 
                                      fast_mode=config.fast_mode)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.AdamW(model_base.parameters(), lr=config.learning_rate, 
-                                     weight_decay=config.weight_decay)
+                                     weight_decay=1e-3)
         
         # 训练模型
-        model_base, log_base = train_model(model_base, train_loader, val_loader, criterion, optimizer, config, "base")
+        model_base, log_base = train_model(model_base, train_loader, test_loader, criterion, optimizer, config, "base")
         
         # 保存结果
         results["base"] = {
             "train_miou": log_base["train_miou"][-1] if log_base["train_miou"] else None,
-            "val_miou": log_base["val_miou"][-1] if log_base["val_miou"] else None,
+            "test_miou": log_base["test_miou"][-1] if log_base["test_miou"] else None,
             "best_miou": log_base["best_miou"] if "best_miou" in log_base else None
         }
     
     # 训练使用CRF掩码的模型
     if not args.base_only:
         print("\n===== Training with CRF pseudo masks =====")
-        crf_dataset = SegmentationDataset(config.img_dir, config.crf_mask_dir, transform, mask_transform)
+        # 创建训练集 - 使用CRF伪标签
+        train_dataset = SegmentationDataset(
+            config.img_dir, 
+            config.crf_mask_dir, 
+            transform, 
+            mask_transform,
+            image_list=train_images  # 只使用训练集图像
+        )
+        
+        # 创建测试集 - 使用真实标签
+        test_dataset = SegmentationDataset(
+            config.img_dir, 
+            config.gt_mask_dir,  # 使用真实标签(trimaps)
+            transform, 
+            mask_transform,
+            image_list=test_images  # 只使用测试集图像
+        )
         
         # 快速模式下只使用少量样本
         if config.fast_mode:
-            crf_dataset = create_fast_mode_subset(crf_dataset, config.fast_samples)
-            print(f"Fast mode: Using {len(crf_dataset)} samples from CRF pseudo masks")
-        
-        # 分割为训练集和验证集
-        train_size = int(config.train_ratio * len(crf_dataset))
-        val_size = len(crf_dataset) - train_size
-        train_dataset, val_dataset = random_split(crf_dataset, [train_size, val_size])
+            train_dataset = create_fast_mode_subset(train_dataset, config.fast_samples)
+            test_dataset = create_fast_mode_subset(test_dataset, config.fast_samples // 5)
+            print(f"Fast mode: Using {len(train_dataset)} samples for training and {len(test_dataset)} for testing")
         
         train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=num_workers)
-        val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=num_workers)
+        test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=num_workers)
         
         # 创建模型、损失函数和优化器
         model_crf = DeepLabLargeFOV(num_classes=config.num_classes, atrous_rates=config.atrous_rates,
                                    fast_mode=config.fast_mode)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.AdamW(model_crf.parameters(), lr=config.learning_rate, 
-                                     weight_decay=config.weight_decay)
+                                     weight_decay=1e-3)
         
         # 训练模型
-        model_crf, log_crf = train_model(model_crf, train_loader, val_loader, criterion, optimizer, config, "crf")
+        model_crf, log_crf = train_model(model_crf, train_loader, test_loader, criterion, optimizer, config, "crf")
         
         # 保存结果
         results["crf"] = {
             "train_miou": log_crf["train_miou"][-1] if log_crf["train_miou"] else None,
-            "val_miou": log_crf["val_miou"][-1] if log_crf["val_miou"] else None,
+            "test_miou": log_crf["test_miou"][-1] if log_crf["test_miou"] else None,
             "best_miou": log_crf["best_miou"] if "best_miou" in log_crf else None
         }
     
     # 打印结果对比
     print("\n===== Results =====")
     print(f"Base Pseudo Masks - Train mIoU: {results['base'].get('train_miou', 'N/A')}")
-    print(f"Base Pseudo Masks - Val mIoU: {results['base'].get('val_miou', 'N/A')}")
+    print(f"Base Pseudo Masks - Test mIoU: {results['base'].get('test_miou', 'N/A')}")
     print(f"CRF Pseudo Masks - Train mIoU: {results['crf'].get('train_miou', 'N/A')}")
-    print(f"CRF Pseudo Masks - Val mIoU: {results['crf'].get('val_miou', 'N/A')}")
+    print(f"CRF Pseudo Masks - Test mIoU: {results['crf'].get('test_miou', 'N/A')}")
     
     # 保存结果对比
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    comparison_path = os.path.join(config.result_dir, f"comparison_results_{timestamp}.json")
+    result_dir = Path(config.result_dir)
+    result_dir.mkdir(exist_ok=True, parents=True)
+    
+    comparison_path = result_dir / f"comparison_results_{timestamp}.json"
     with open(comparison_path, 'w') as f:
         json.dump(results, f, indent=4)
     
     # 保存CSV格式结果
-    csv_path = os.path.join(config.result_dir, f"miou_comparison_{timestamp}.csv")
+    csv_path = result_dir / f"miou_comparison_{timestamp}.csv"
     with open(csv_path, 'w') as f:
-        f.write("train mIoU,train+CRF mIoU,val mIoU,val+CRF mIoU\n")
+        f.write("train mIoU,train+CRF mIoU,test mIoU,test+CRF mIoU\n")
         f.write(f"{results['base'].get('train_miou', 0):.4f},{results['crf'].get('train_miou', 0):.4f}," +
-                f"{results['base'].get('val_miou', 0):.4f},{results['crf'].get('val_miou', 0):.4f}\n")
+                f"{results['base'].get('test_miou', 0):.4f},{results['crf'].get('test_miou', 0):.4f}\n")
     
     print(f"Results comparison saved to {comparison_path}")
     print(f"mIoU comparison CSV saved to {csv_path}")

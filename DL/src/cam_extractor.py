@@ -11,10 +11,13 @@ import torch.cuda.amp as amp
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import models
 import torchvision.transforms as transforms
-import cv2
+from PIL import Image, ImageFilter
+from skimage.filters import threshold_otsu
+from concurrent.futures import ThreadPoolExecutor
+from torch.utils.data import random_split
 
-from config import CLASSIFIER_CONFIG, CAM_DIR, CLASSIFIER_DIR, IMAGE_DIR, DATASET_CONFIG, FAST_TEST_CONFIG, CAM_CONFIG
-from utils import get_dataloaders, visualize_cam, save_cam, set_seed
+from config import CLASSIFIER_CONFIG, CAM_DIR, CLASSIFIER_DIR, IMAGE_DIR, CAM_CONFIG
+from utils import get_dataloaders, get_dataloaders_from_split, visualize_cam, save_cam, set_seed
 
 class CAMModel(nn.Module):
     """
@@ -27,11 +30,9 @@ class CAMModel(nn.Module):
         if backbone == "resnet18":
             base_model = models.resnet18(weights='IMAGENET1K_V1' if pretrained else None)
             self.feature_dim = 512  # ResNet18最后一层特征维度
-            print(f"使用模型: ResNet18 {'(带预训练权重)' if pretrained else '(不使用预训练权重)'}")
         else:
             base_model = models.resnet50(weights='IMAGENET1K_V1' if pretrained else None)
             self.feature_dim = 2048  # ResNet50最后一层特征维度
-            print(f"使用模型: ResNet50 {'(带预训练权重)' if pretrained else '(不使用预训练权重)'}")
         
         # 提取多尺度特征 (保留中间层特征)
         self.layer1 = nn.Sequential(*list(base_model.children())[:5])  # 浅层特征
@@ -175,6 +176,7 @@ class CAMExtractor:
         """
         self.config = config if config is not None else CLASSIFIER_CONFIG
         self.device = torch.device(self.config['device'])
+        self.model_path = Path(CLASSIFIER_DIR) / "classifier_model.pth"
         
         # 创建CAM模型
         self.model = CAMModel(num_classes=self.config['num_classes'], 
@@ -221,19 +223,7 @@ class CAMExtractor:
         Path(CLASSIFIER_DIR).mkdir(parents=True, exist_ok=True)
         Path(CAM_DIR).mkdir(parents=True, exist_ok=True)
         
-        # 模型路径
-        self.model_path = Path(CLASSIFIER_DIR) / "classifier_model.pth"
-        
-       
-        if hasattr(amp, 'GradScaler'):
-            self.scaler = amp.GradScaler()
-        else:
-        
-            try:
-                self.scaler = torch.amp.GradScaler('cuda' if torch.cuda.is_available() else 'cpu')
-            except:
-               
-                self.scaler = amp.GradScaler()
+        self.scaler = torch.amp.GradScaler()
         
         # 添加带预热的余弦退火学习率
         total_epochs = config['epochs']
@@ -321,7 +311,9 @@ class CAMExtractor:
                 self.optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
                 
                 # 混合精度前向传播
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                device_type = "cuda" if torch.cuda.is_available() else "cpu"
+                with torch.amp.autocast(device_type=device_type, enabled=use_amp):
+
                     outputs = self.model(images)
                     loss = self.criterion(outputs, labels)
                 
@@ -392,7 +384,9 @@ class CAMExtractor:
         total = 0
         
         # 使用更大的批量进行评估
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.config.get('use_mixed_precision', True)):
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=self.config.get('use_mixed_precision', True)):
+
             for batch in dataloader:
                 images = batch['image'].to(self.device, non_blocking=True)
                 labels = batch['label'].to(self.device, non_blocking=True)
@@ -430,11 +424,75 @@ class CAMExtractor:
         
         print(f"Generating CAMs for {len(data_loader.dataset)} images...")
         
+        # 准备保存任务队列
+        from queue import Queue
+        save_queue = Queue()
+        
         # 启用CUDA优化
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.config.get('use_mixed_precision', True)):
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        use_amp = self.config.get('use_mixed_precision', True) and torch.cuda.is_available()
+        
+        # 预先创建GPU上的形态学核
+        morph_kernel = torch.ones(3, 3, device=self.device)
+        
+        # 创建专用线程池处理保存操作
+        def save_worker():
+            while True:
+                item = save_queue.get()
+                if item is None:  # 结束信号
+                    break
+                    
+                cam_pred, image, image_path, save_dir = item
+                try:
+                    image_name = Path(image_path).stem
+                    cam_image_path = save_dir / f"{image_name}_cam.png"
+                    cam_data_path = save_dir / f"{image_name}_cam.npy"
+                    
+                    # 保存PNG图像
+                    visualize_cam(image.cpu(), cam_pred, save_path=cam_image_path)
+                    
+                    # 保存原始CAM数据
+                    np.save(cam_data_path, cam_pred)
+                except Exception as e:
+                    print(f"Failed to save CAM for {image_path}: {e}")
+                finally:
+                    save_queue.task_done()
+        
+        # 启动保存工作线程
+        import threading
+        num_save_workers = min(os.cpu_count(), 4)  # 限制保存线程数
+        save_threads = []
+        for _ in range(num_save_workers):
+            t = threading.Thread(target=save_worker, daemon=True)
+            t.start()
+            save_threads.append(t)
+            
+        # 工具函数：GPU上的形态学操作
+        def gpu_morphology(tensor, kernel):
+            # 膨胀操作
+            dilated = torch.nn.functional.conv2d(
+                tensor.unsqueeze(0).unsqueeze(0),
+                kernel.unsqueeze(0).unsqueeze(0),
+                padding=1
+            ).squeeze() > 0
+            
+            # 腐蚀操作
+            eroded = 1.0 - torch.nn.functional.conv2d(
+                (1.0 - dilated.float()).unsqueeze(0).unsqueeze(0),
+                kernel.unsqueeze(0).unsqueeze(0),
+                padding=1
+            ).squeeze() > 0
+            
+            return eroded
+            
+        # 增加批量大小以提高吞吐量
+        original_batch_size = data_loader.batch_size
+        
+        # 处理每个批次的CAM
+        with torch.no_grad(), torch.amp.autocast(device_type=device_type, enabled=use_amp):
             for batch_idx, batch in enumerate(data_loader):
                 # 定期打印进度
-                if batch_idx % 10 == 0 or batch_idx == len(data_loader) - 1:
+                if batch_idx % 5 == 0 or batch_idx == len(data_loader) - 1:
                     print(f"  Processing batch {batch_idx+1}/{len(data_loader)} ({(batch_idx+1)/len(data_loader)*100:.1f}%)")
                 
                 # 高效数据加载
@@ -446,76 +504,92 @@ class CAMExtractor:
                 outputs, cams, probas = self.model(images, return_cam=True)
                 _, predicted = outputs.max(1)
                 
-                # 批量处理CAM和保存操作
+                # 批量处理CAM (尽可能保持GPU上的计算)
                 for i, (image, cam, pred, image_path) in enumerate(zip(images, cams, predicted, image_paths)):
                     try:
-                        # 获取预测类别的CAM
-                        cam_pred = cam[pred].cpu().numpy()
+                        # 保持CAM在GPU上进行计算
+                        cam_gpu = cam[pred]  # 选择预测类别的CAM
                         
-                        # 调整CAM大小到原图尺寸
+                        # 阈值处理
+                        cam_gpu = torch.nn.functional.threshold(cam_gpu, CAM_CONFIG["threshold"], 0)
+                        
+                        # 转为二值图
+                        cam_binary = (cam_gpu > 0).float()
+                        
+                        # 使用GPU上的形态学操作 (闭运算：先膨胀后腐蚀)
+                        if CAM_CONFIG.get("use_morphology", True):
+                            cam_closed = gpu_morphology(cam_binary, morph_kernel)
+                            cam_gpu = cam_gpu * cam_closed.float()
+                        
+                        # 调整CAM大小到原图尺寸 (仍在GPU上)
                         img_size = self.config['image_size']
-                        cam_pred = torch.nn.functional.interpolate(
-                            torch.tensor(cam_pred).unsqueeze(0).unsqueeze(0),
+                        cam_resized = torch.nn.functional.interpolate(
+                            cam_gpu.unsqueeze(0).unsqueeze(0),
                             size=img_size,
                             mode='bilinear',
                             align_corners=False
-                        ).squeeze().numpy()
+                        ).squeeze()
                         
-                        # 归一化和处理CAM
-                        cam_pred = cam_pred - cam_pred.min()
-                        cam_max = cam_pred.max()
-                        if cam_max > 0:
-                            cam_pred = cam_pred / cam_max
+                        # 归一化 (仍在GPU上)
+                        cam_min = cam_resized.min()
+                        cam_max = cam_resized.max()
+                        if cam_max > cam_min:
+                            cam_resized = (cam_resized - cam_min) / (cam_max - cam_min)
                         else:
-                            cam_pred = np.zeros_like(cam_pred)
+                            cam_resized = torch.zeros_like(cam_resized)
                         
                         # 应用配置的阈值处理
                         if CAM_CONFIG.get("use_adaptive_threshold", False):
-                            # 使用自适应阈值
-                            cam_uint8 = (cam_pred * 255).astype(np.uint8)
-                            otsu_threshold, _ = cv2.threshold(
-                                cam_uint8, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU
-                            )
+                            # 计算 Otsu 阈值 (需要转到CPU)
+                            cam_uint8 = (cam_resized.cpu().numpy() * 255).astype(np.uint8)
+                            otsu_threshold = threshold_otsu(cam_uint8)
                             threshold = 0.7 * (otsu_threshold / 255.0) + 0.3 * CAM_CONFIG["threshold"]
-                            cam_pred[cam_pred < threshold] = 0
+                            
+                            # 应用阈值 (返回到GPU)
+                            threshold_tensor = torch.tensor(threshold, device=self.device)
+                            cam_resized = torch.where(cam_resized < threshold_tensor, 
+                                                     torch.zeros_like(cam_resized), 
+                                                     cam_resized)
                         else:
                             # 使用固定阈值
-                            cam_pred[cam_pred < CAM_CONFIG["threshold"]] = 0
+                            cam_resized = torch.where(cam_resized < CAM_CONFIG["threshold"], 
+                                                     torch.zeros_like(cam_resized), 
+                                                     cam_resized)
                         
-                        # 应用gamma校正和形态学处理
-                        cam_pred = np.power(cam_pred, CAM_CONFIG["gamma"])
+                        # 应用gamma校正 (仍在GPU上)
+                        cam_resized = torch.pow(cam_resized, CAM_CONFIG["gamma"])
                         
-                        if CAM_CONFIG.get("use_morphology", True):
-                            cam_binary = (cam_pred > 0).astype(np.uint8)
-                            kernel = np.ones((3, 3), np.uint8)
-                            cam_binary = cv2.morphologyEx(cam_binary, cv2.MORPH_CLOSE, kernel)
-                            cam_pred = cam_pred * cam_binary
+                        # 现在需要转到CPU进行身体区域扩展
+                        cam_cpu = cam_resized.cpu().numpy()
                         
                         # 应用身体区域扩展
-                        cam_pred = _expand_head_to_body(cam_pred)
-                        
-                        # 异步保存PNG和NPY文件
-                        image_name = Path(image_path).stem
-                        cam_image_path = save_dir / f"{image_name}_cam.png"
-                        cam_data_path = save_dir / f"{image_name}_cam.npy"
-                        
-                        # 保存PNG图像
-                        try:
-                            visualize_cam(image.cpu(), cam_pred, save_path=cam_image_path)
-                        except Exception as e:
-                            print(f"Failed to save PNG for {image_path}: {e}")
-                        
-                        # 保存原始CAM数据
-                        try:
-                            np.save(cam_data_path, cam_pred)
-                        except Exception as e:
-                            print(f"Failed to save NPY for {image_path}: {e}")
+                        if CAM_CONFIG.get("use_morphology", True):
+                            cam_cpu = _expand_head_to_body(cam_cpu)
                         
                         # 添加到结果列表
-                        all_cams.append(cam_pred)
+                        all_cams.append(cam_cpu)
                         all_image_paths.append(image_path)
+                        
+                        # 将保存任务添加到队列
+                        save_queue.put((cam_cpu, image, image_path, save_dir))
+                        
                     except Exception as e:
                         print(f"Error processing image {image_path}: {e}")
+                
+                # 每隔几个批次清理一次GPU内存
+                if torch.cuda.is_available() and batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
+        
+        # 等待所有保存任务完成
+        save_queue.join()
+        
+        # 向保存线程发送结束信号
+        for _ in range(num_save_workers):
+            save_queue.put(None)
+        
+        # 等待所有线程完成
+        for t in save_threads:
+            t.join()
         
         print(f"CAM generation completed. {len(all_cams)} CAMs generated.")
         return all_cams, all_image_paths
@@ -541,71 +615,63 @@ class CAMExtractor:
         print(f"Loaded model from {model_path}")
 
 def get_enhanced_dataloaders(
-    image_dir, batch_size, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1, seed=42, fast_test=False
+    image_dir, batch_size, seed=42, config=None
 ):
     """
-    创建数据加载器，包含增强的数据预处理
+    创建数据加载器，包含增强的数据预处理，使用官方数据集划分
+    
+    参数:
+        image_dir: 图像目录路径
+        batch_size: 批量大小
+        seed: 随机种子
+        config: 配置字典，包含优化参数
+        
+    返回:
+        tuple: (train_loader, test_loader) - 只包含训练集和测试集
     """
-    from utils import get_dataloaders
+    # 确保配置有效
+    if config is None:
+        config = CLASSIFIER_CONFIG.copy()
     
-    # 增强的数据预处理
-    from utils import CustomDataset
-    
-    # 获取原始数据加载器
-    train_loader, val_loader, test_loader = get_dataloaders(
+    print("Using official dataset split...")
+    # 使用官方数据集划分
+    train_loader, test_loader = get_dataloaders_from_split(
         image_dir=image_dir,
         batch_size=batch_size,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        test_ratio=test_ratio,
         seed=seed,
-        fast_test=fast_test,
-        # 增加其他参数传递
+        config=config
     )
     
-    return train_loader, val_loader, test_loader
+    return train_loader, test_loader
 
-def train_classifier_and_extract_cams(train_ratio=0.8, val_ratio=0.1, test_ratio=0.1, seed=42, fast_test=None, skip_train_eval=False, skip_cam_gen=False):
+def train_classifier_and_extract_cams(seed=42, skip_train_eval=False, skip_cam_gen=False):
     """
     训练分类模型并提取CAM
     
     参数:
-        train_ratio: 训练集比例
-        val_ratio: 验证集比例
-        test_ratio: 测试集比例
         seed: 随机种子
-        fast_test: 快速测试配置
         skip_train_eval: 是否跳过训练集评估
         skip_cam_gen: 是否跳过CAM生成
         
     返回:
         CAMExtractor: 训练好的CAM提取器实例
     """
-    from config import CLASSIFIER_CONFIG, FAST_TEST_CONFIG
+    from config import CLASSIFIER_CONFIG, IMAGE_DIR
     
     # 使用配置创建CAM提取器
     config = CLASSIFIER_CONFIG.copy()
     
-    # 检查是否为快速测试模式
-    if fast_test is None and FAST_TEST_CONFIG.get("enabled", False):
-        fast_test = FAST_TEST_CONFIG
-        print("Enabling fast test mode")
-        config["epochs"] = fast_test.get("epochs", 3)
-        config["batch_size"] = fast_test.get("batch_size", 16)
-        
     # 创建CAM提取器
-    cam_extractor = CAMExtractor(config)
-    
-    # 优化数据加载器的创建 - 将配置传递给数据加载器
-    train_loader, val_loader, test_loader = get_dataloaders(
+    cam_extractor = CAMExtractor(config) 
+
+    # 创建数据加载器
+    print("Using official dataset split...")
+    from utils import get_dataloaders_from_split
+    train_loader, test_loader = get_dataloaders_from_split(
         image_dir=IMAGE_DIR,
         batch_size=config["batch_size"],
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        test_ratio=test_ratio,
         seed=seed,
-        fast_test=fast_test,
-        config=config  # 传递完整配置
+        config=config
     )
     
     # 检查是否需要训练或加载模型
@@ -615,7 +681,38 @@ def train_classifier_and_extract_cams(train_ratio=0.8, val_ratio=0.1, test_ratio
         cam_extractor.load_model(model_path)
     else:
         print("Training new model")
-        cam_extractor.train(train_loader, val_loader)
+        # 从训练集中分出一部分作为验证集来监控训练
+        train_dataset = train_loader.dataset
+        train_size = int(0.9 * len(train_dataset))
+        val_size = len(train_dataset) - train_size
+        train_subset, val_subset = random_split(
+            train_dataset, 
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(seed)
+        )
+        
+        # 创建新的数据加载器
+        train_subset_loader = DataLoader(
+            train_subset,
+            batch_size=config["batch_size"],
+            shuffle=True,
+            num_workers=train_loader.num_workers,
+            pin_memory=True,
+            prefetch_factor=2,
+            drop_last=True
+        )
+        
+        val_subset_loader = DataLoader(
+            val_subset,
+            batch_size=config["batch_size"]*2,
+            shuffle=False,
+            num_workers=train_loader.num_workers,
+            pin_memory=True,
+            prefetch_factor=2
+        )
+        
+        # 使用分割后的训练集和验证集进行训练
+        cam_extractor.train(train_subset_loader, val_subset_loader)
     
     # 评估测试集
     print("Evaluating test set performance...")
@@ -624,19 +721,14 @@ def train_classifier_and_extract_cams(train_ratio=0.8, val_ratio=0.1, test_ratio
     
     if skip_train_eval:
         print("Skipping train set evaluation to save time...")
-        train_acc = 0.0  # 占位值
-        val_acc = 0.0    # 占位值
     else:
         try:
             # 对训练集进行评估
-            print("Evaluating train and validation sets...")
+            print("Evaluating train set...")
             train_acc = cam_extractor.evaluate(train_loader)
-            val_acc = cam_extractor.evaluate(val_loader)
+            print(f"Train set accuracy: {train_acc:.2f}%")
         except Exception as e:
             print(f"Error during train set evaluation: {e}")
-            print("Using test set accuracy as fallback...")
-            train_acc = test_acc
-            val_acc = test_acc
     
     # 是否跳过CAM生成
     if skip_cam_gen:
@@ -655,152 +747,135 @@ def train_classifier_and_extract_cams(train_ratio=0.8, val_ratio=0.1, test_ratio
     
     return cam_extractor
 
-def visualize_cam(image, cam, save_path=None, alpha=0.5):
+def visualize_cam_pil(image, cam, save_path=None, alpha=0.5, cam_config=None):
     """
-    CAM可视化函数，支持边缘增强和多种热图模式
-    
+    用 PIL 替代 OpenCV 实现的 CAM 可视化函数（不使用 matplotlib 或 ImageDraw）
+
     参数:
         image: 输入图像张量或numpy数组
-        cam: 类激活图numpy数组
-        save_path: 保存可视化结果的路径
-        alpha: 叠加的透明度因子
+        cam: 类激活图 numpy 数组 (H, W)，范围 [0,1]
+        save_path: 可选保存路径
+        alpha: 叠加透明度
+        cam_config: 可选 CAM_CONFIG 字典
     """
+    if cam_config is None:
+        cam_config = {}
+
     if isinstance(image, torch.Tensor):
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
         image = image * std + mean
         image = image.permute(1, 2, 0).cpu().numpy()
         image = np.clip(image, 0, 1)
-    
-    image_uint8 = (image * 255).astype(np.uint8)
-    
-    if len(image_uint8.shape) == 2:
-        image_uint8 = cv2.cvtColor(image_uint8, cv2.COLOR_GRAY2BGR)
-    
-    h, w = image_uint8.shape[:2]
-    cam_resized = cv2.resize(cam, (w, h))
-    
-    # 应用阈值处理，低于阈值的像素设为0
-    cam_resized[cam_resized < CAM_CONFIG["threshold"]] = 0
-    
-    # 应用Canny边缘检测增强边缘
-    if CAM_CONFIG["apply_canny"]:
-        try:
-            image_gray = cv2.cvtColor(image_uint8, cv2.COLOR_RGB2GRAY) if image_uint8.shape[2] == 3 else image_uint8
-            edges = cv2.Canny(image_gray, CAM_CONFIG["canny_low"], CAM_CONFIG["canny_high"])
-            # 在边缘处增强CAM
-            cam_resized = cam_resized.copy()  # 创建副本以避免修改原始数据
-            cam_resized[edges > 0] *= 1.5  # 边缘位置增强CAM
-        except Exception as e:
-            print(f"Edge enhancement failed: {e}")
-    
-    # 使用颜色映射增强热图可视化效果
-    cam_uint8 = (cam_resized * 255).astype(np.uint8)
-    colormap = CAM_CONFIG.get("colormap", cv2.COLORMAP_JET)
-    heatmap = cv2.applyColorMap(cam_uint8, colormap)
-    
-    # 确保形状匹配
-    assert image_uint8.shape[:2] == heatmap.shape[:2], f"Shape mismatch: image={image_uint8.shape}, heatmap={heatmap.shape}"
-    
-    if image_uint8.shape[2] == 3:
-        image_uint8_bgr = cv2.cvtColor(image_uint8, cv2.COLOR_RGB2BGR)
-    else:
-        image_uint8_bgr = image_uint8
-    
-    # 应用对比度增强
-    alpha_actual = CAM_CONFIG.get("overlay_alpha", alpha)
-    overlay = cv2.addWeighted(image_uint8_bgr, 1-alpha_actual, heatmap, alpha_actual, 0)
-    
-    # 生成并排显示的结果
-    result = np.zeros((h, w*2, 3), dtype=np.uint8)
-    result[:, :w] = image_uint8_bgr
-    result[:, w:] = overlay
-    
-    # 添加标题
-    cv2.putText(result, 'Original', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    cv2.putText(result, 'CAM Overlay', (w+10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-    
+    image_uint8 = (image * 255).astype(np.uint8)
+    pil_image = Image.fromarray(image_uint8).convert("RGB")
+    w, h = pil_image.size
+
+    # 处理 CAM，阈值过滤
+    cam = np.clip(cam, 0, 1)
+    cam[cam < cam_config.get("threshold", 0.05)] = 0
+    cam_resized = Image.fromarray((cam * 255).astype(np.uint8)).resize((w, h)).convert("L")
+
+    # 构造简化的彩色热图（只使用 PIL，用红色增强高激活区域）
+    cam_color = Image.new("RGB", (w, h))
+    cam_pixels = cam_resized.load()
+    color_pixels = cam_color.load()
+
+    for i in range(w):
+        for j in range(h):
+            v = cam_pixels[i, j]
+            color_pixels[i, j] = (v, 0, 0)  # 红色为主
+
+    # 混合热图和原图
+    overlay_alpha = cam_config.get("overlay_alpha", alpha)
+    overlay = Image.blend(pil_image, cam_color, overlay_alpha)
+
+    # 拼接图像：原图 | 叠加图
+    result = Image.new("RGB", (w * 2, h))
+    result.paste(pil_image, (0, 0))
+    result.paste(overlay, (w, 0))
+
+    # 保存或显示结果
     try:
         if save_path:
-            cv2.imwrite(str(save_path), result)
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            result.save(save_path)
         else:
-            cv2.imshow('CAM Visualization', result)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
+            result.show()
     except Exception as e:
-        print(f"Error saving visualization result: {e}")
-        # 尝试仅保存热力图
-        try:
-            cv2.imwrite(str(save_path), cam_uint8)
-        except:
-            print(f"Saving simplified CAM also failed")
+        print(f"Error saving CAM visualization: {e}")
 
 def _expand_head_to_body(cam_pred):
-    """扩展头部激活到整个身体区域"""
-    # 创建二值化版本找到关键区域
+    """优化的CAM扩展函数，使用numpy高效矢量化操作"""
+    # 创建二值掩码
     binary = (cam_pred > CAM_CONFIG["threshold"]).astype(np.uint8)
+    if not np.any(binary):
+        return cam_pred  # 如果没有检测到区域，直接返回
     
-    # 形态学膨胀操作扩展激活区域
+    # 快速膨胀操作
     kernel_size = CAM_CONFIG.get("morphology_kernel_size", 5)
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    dilate_iterations = CAM_CONFIG.get("dilate_iterations", 2)
+    iterations = CAM_CONFIG.get("dilate_iterations", 2)
     
-    # 形态学膨胀，向下扩展
-    dilated = cv2.dilate(binary, kernel, iterations=dilate_iterations)
+    # 替代custom dilation的更高效实现
+    from scipy import ndimage
+    dilated = binary.copy()
+    for _ in range(iterations):
+        dilated = ndimage.maximum_filter(dilated, size=kernel_size)
     
-    # 寻找连通区域
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+    # 寻找连通区域的快速方法
+    labels, num_features = ndimage.label(dilated)
+    if num_features == 0:
+        return cam_pred
     
-    # 找到最大的区域（可能是头部）
-    if num_labels > 1:  # 确保有至少一个区域
-        # 忽略背景（索引0）
-        largest_label = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
-        largest_mask = (labels == largest_label).astype(np.uint8)
-        
-        # 获取区域的边界框
-        x, y, w, h, area = stats[largest_label]
-        
-        # 考虑扩展的比例因子
-        expansion_factor = CAM_CONFIG.get("body_expansion_factor", 1.3)
-        expanded_h = int(h * expansion_factor)
-        
-        # 创建向下扩展的区域
-        expanded_mask = np.zeros_like(largest_mask)
-        expanded_mask[y:min(y+expanded_h, binary.shape[0]), x:x+w] = 1
-        
-        # 合并原始CAM与扩展区域
-        expanded_binary = np.maximum(binary, expanded_mask)
-        
-        # 重新应用到原始CAM
-        # 保留原始值，但扩展区域应用较小的值
-        result = cam_pred.copy()
-        # 在扩展区域中，将0值替换为原始值的0.5倍（只在扩展区域，非原始激活区域）
-        extension_mask = (expanded_mask > 0) & (binary == 0)
-        
-        if extension_mask.any():
-            # 计算原始区域的平均值作为扩展区域的值
-            orig_mean = cam_pred[binary > 0].mean() if (binary > 0).any() else 0.3
-            result[extension_mask] = max(0.3, orig_mean * 0.7)  # 设置为原始区域的70%
-        
-        return result
+    # 计算所有区域的属性
+    objects = ndimage.find_objects(labels)
+    region_sizes = np.array([(x.stop-x.start) * (y.stop-y.start) for x, y in objects])
     
-    return cam_pred
+    if len(region_sizes) == 0:
+        return cam_pred
+    
+    # 找出最大区域
+    largest_idx = np.argmax(region_sizes)
+    minr, minc = objects[largest_idx][0].start, objects[largest_idx][1].start
+    maxr, maxc = objects[largest_idx][0].stop, objects[largest_idx][1].stop
+    
+    h = maxr - minr
+    
+    # 计算扩展后的高度
+    expansion_factor = CAM_CONFIG.get("body_expansion_factor", 1.3)
+    expanded_h = int(h * expansion_factor)
+    end_r = min(minr + expanded_h, binary.shape[0])
+    
+    # 创建扩展掩码
+    expanded_mask = np.zeros_like(binary)
+    expanded_mask[minr:end_r, minc:maxc] = 1
+    
+    # 组合原始二值图和扩展掩码
+    expanded_binary = np.maximum(binary, expanded_mask)
+    
+    # 创建结果
+    result = cam_pred.copy()
+    extension_mask = (expanded_mask > 0) & (binary == 0)
+    
+    if np.any(extension_mask):
+        orig_mean = np.mean(cam_pred[binary > 0]) if np.any(binary > 0) else 0.3
+        result[extension_mask] = max(0.3, orig_mean * 0.7)
+    
+    return result
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip_train_eval", action="store_true", help="Skip training set evaluation to avoid memory issues")
     parser.add_argument("--skip_cam_gen", action="store_true", help="Skip CAM generation step")
-    parser.add_argument("--fast", action="store_true", help="Enable fast test mode with reduced data and training epochs")
     args = parser.parse_args()
     
+    # 设置随机种子
+    set_seed(42)
+    
     train_classifier_and_extract_cams(
-        train_ratio=DATASET_CONFIG['train_ratio'],
-        val_ratio=DATASET_CONFIG['val_ratio'],
-        test_ratio=DATASET_CONFIG['test_ratio'],
-        seed=DATASET_CONFIG['random_seed'],
+        seed=42,
         skip_train_eval=args.skip_train_eval,
-        skip_cam_gen=args.skip_cam_gen,
-        fast_test=args.fast
+        skip_cam_gen=args.skip_cam_gen
     ) 

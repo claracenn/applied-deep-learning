@@ -1,1 +1,2 @@
 pydensecrf @ git+https://github.com/lucasb-eyer/pydensecrf.git@master
+pip install scikit-image

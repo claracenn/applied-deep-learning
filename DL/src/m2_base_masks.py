@@ -69,35 +69,26 @@ def load_cam(cam_path):
         print(f"Error loading CAM file {cam_path}: {e}")
         return None
 
-def apply_simple_threshold(cam, threshold=0.5, morph_kernel_size=5):
-    """
-    对CAM应用简单阈值处理以生成二值掩码
-    
-    参数:
-        cam: 类激活图数组，形状为(H, W)，值在[0, 1]范围内
-        threshold: 阈值，默认为0.5
-        morph_kernel_size: 形态学操作的核大小
-        
-    返回:
-        numpy.ndarray: 形状为(H, W)的二值掩码，值为0或1
-    """
-    if cam is None:
-        return None
-    
-    # 应用阈值
+def apply_simple_threshold(cam, threshold=0.8, morph_kernel_size=3, target_fg_percent=20.0, max_fg_percent=35.0):
     binary_mask = (cam > threshold).astype(np.uint8)
+    current_fg_percent = binary_mask.mean() * 100
+
+    # 关闭动态调整阈值
+    # if current_fg_percent > max_fg_percent:
+    #     new_threshold = threshold
+    #     while current_fg_percent > target_fg_percent and new_threshold < 0.95:
+    #         new_threshold += 0.05
+    #         binary_mask = (cam > new_threshold).astype(np.uint8)
+    #         current_fg_percent = binary_mask.mean() * 100
+    #         print(f"  Adjusted threshold to {new_threshold:.2f}, foreground: {current_fg_percent:.2f}%")
     
-    # 将numpy数组转为PIL图像以应用形态学操作
-    img = Image.fromarray(binary_mask * 255)
-    
-    # 应用闭运算以填充小空洞并平滑边缘 - 使用PIL的过滤器
-    img = img.filter(ImageFilter.MinFilter(morph_kernel_size))
-    img = img.filter(ImageFilter.MaxFilter(morph_kernel_size))
-    
-    # 转回numpy数组并确保是二值的
-    binary_mask = np.array(img) > 0
-    
+    if morph_kernel_size > 0:
+        img = Image.fromarray(binary_mask * 255)
+        img = img.filter(ImageFilter.MinFilter(morph_kernel_size))
+        binary_mask = np.array(img) > 0
+
     return binary_mask.astype(np.uint8)
+
 
 def numpy_otsu_threshold(image):
     """
@@ -130,14 +121,14 @@ def numpy_otsu_threshold(image):
     
     return threshold
 
-def process_cam_to_mask(cam_path, output_dir, threshold=0.5, adaptive_threshold=True, morph_kernel_size=5):
+def process_cam_to_mask(cam_path, output_dir, threshold=0.8, adaptive_threshold=False, morph_kernel_size=3, target_fg_percent=12.0, max_fg_percent=15.0):
     """
     处理单个CAM文件并保存结果掩码（不使用CRF）
     
     参数:
         cam_path: CAM .npy文件的路径
         output_dir: 保存结果掩码的目录
-        threshold: 阈值，默认为0.5
+        threshold:
         adaptive_threshold: 是否使用自适应阈值
         morph_kernel_size: 形态学操作的核大小
         
@@ -166,8 +157,8 @@ def process_cam_to_mask(cam_path, output_dir, threshold=0.5, adaptive_threshold=
             threshold = otsu_threshold  # 转换回[0,1]范围
             print(f"Using adaptive threshold: {threshold:.3f}")
         
-        # 应用阈值处理
-        mask = apply_simple_threshold(cam, threshold, morph_kernel_size)
+        # 应用阈值处理，传递目标前景比例参数
+        mask = apply_simple_threshold(cam, threshold, morph_kernel_size, target_fg_percent, max_fg_percent)
         
         # 确保掩码是严格的二值图像(0和1)，而不是(0和255)
         # 这一步很重要，它确保保存的掩码文件能被正确读取为二值图像
@@ -217,6 +208,8 @@ def main():
     parser.add_argument('--threshold', type=float, default=BASE_MASK_CONFIG["threshold"], help='Threshold for binary mask generation')
     parser.add_argument('--adaptive', action='store_true', default=BASE_MASK_CONFIG["adaptive_threshold"], help='Use adaptive (Otsu) thresholding')
     parser.add_argument('--morph_size', type=int, default=BASE_MASK_CONFIG["morph_kernel_size"], help='Kernel size for morphological operations')
+    parser.add_argument('--target_fg', type=float, default=BASE_MASK_CONFIG.get("target_foreground_percent", 12.0), help='Target foreground percentage')
+    parser.add_argument('--max_fg', type=float, default=BASE_MASK_CONFIG.get("max_foreground_percent", 15.0), help='Maximum foreground percentage')
     args = parser.parse_args()
     
     # 设置路径
@@ -239,7 +232,7 @@ def main():
     # 处理每个CAM文件
     success_count = 0
     for cam_file in cam_files:
-        if process_cam_to_mask(cam_file, output_dir, args.threshold, args.adaptive, args.morph_size):
+        if process_cam_to_mask(cam_file, output_dir, args.threshold, args.adaptive, args.morph_size, args.target_fg, args.max_fg):
             success_count += 1
     
     print(f"Processing completed. Successfully processed {success_count}/{len(cam_files)} files.")

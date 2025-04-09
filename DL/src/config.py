@@ -3,14 +3,18 @@ from pathlib import Path
 import torch
 
 # 项目路径
-PROJECT_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))).resolve()
 DATA_ROOT = PROJECT_ROOT / "data"
 OUTPUT_ROOT = PROJECT_ROOT / "outputs"
-MODEL_ROOT = Path(os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")))
+MODEL_ROOT = PROJECT_ROOT / "models"  
 
 # 数据路径
 IMAGE_DIR = DATA_ROOT / "images"
 ANNOTATION_DIR = DATA_ROOT / "annotations"
+
+# 数据集划分文件 - 只有训练集和测试集
+TRAIN_FILE = ANNOTATION_DIR / "trainval.txt"  # 使用trainval.txt作为训练集
+TEST_FILE = ANNOTATION_DIR / "test.txt"       # 使用test.txt作为测试集
 
 # 输出路径
 CAM_DIR = OUTPUT_ROOT / "cams"
@@ -26,6 +30,8 @@ SEGMENTOR_DIR = MODEL_ROOT / "segmentor"
 for dir_path in [
     OUTPUT_ROOT, 
     CAM_DIR,
+    PSEUDO_MASK_DIR,
+    SEGMENTATION_DIR,
     MODEL_ROOT, CLASSIFIER_DIR, SEGMENTOR_DIR
 ]:
     dir_path.mkdir(exist_ok=True, parents=True)
@@ -40,7 +46,7 @@ CAM_CONFIG = {
     "canny_high": 100,                 # Canny高阈值
     "use_adaptive_threshold": True,   # 是否使用自适应阈值
     "use_morphology": True,            # 是否使用形态学操作
-    "colormap": None,                  # 热图颜色映射，移除cv2引用
+    "colormap": "jet",                  # 热图颜色映射，移除cv2引用
     "overlay_alpha": 0.7,              # 热图透明度
     "multi_scale_fusion": True,        # 是否使用多尺度特征融合
     "morphology_kernel_size": 5,       # 形态学核大小
@@ -53,7 +59,7 @@ CAM_CONFIG = {
 # 基础掩码生成参数
 BASE_MASK_CONFIG = {
     "threshold": 0.5,                  # 阈值，用于分离前景和背景
-    "adaptive_threshold": True,        # 是否使用自适应阈值
+    "adaptive_threshold": False,        # 是否使用自适应阈值
     "morph_kernel_size": 5             # 形态学操作的核大小
 }
 
@@ -90,17 +96,60 @@ CLASSIFIER_CONFIG = {
     "non_blocking": True         # 是否使用非阻塞数据传输
 }
 
-FAST_TEST_CONFIG = {
-    "enabled": False, 
-    "max_samples": 50,  # 最大样本数量
-    "epochs": 1,        # 训练轮次
-    "batch_size": 16    # 批量大小
+# 数据集划分
+# 注意：此配置仅在使用随机划分时生效 (使用 --use_random_split 参数)
+# 默认情况下使用官方数据集划分文件 (trainval.txt 和 test.txt)
+
+SEGMENTATION_CONFIG = {
+    "backbone": "resnet50",            # 使用的骨干网络
+    "atrous_rates": (6, 12, 18, 24),  # 空洞卷积率
+    "num_classes": 2,                  # 类别数量
+    "batch_size": 8,                   # 批量大小
+    "num_epochs": 5,                   # 训练轮次
+    "learning_rate": 1e-4,             # 学习率
+    "weight_decay": 1e-4,              # 权重衰减
+    "train_ratio": 0.8,                # 训练集比例
+    "test_ratio": 0.2,                # 测试集比例
+    "image_size": (224, 224),          # 图像大小 (height, width)
+    "save_every": 5,                   # 每隔多少个epoch保存一次模型
+    "eval_every": 1,                   # 每隔多少个epoch评估一次模型
+    "num_workers": 0,                  # 数据加载线程数
+    "device": "cuda" if torch.cuda.is_available() else "cpu",  # 训练设备
+    "weighted_loss": True,             # 是否使用带权重的损失函数
+    "foreground_weight": 0.5,          # 前景类权重 (修改为平衡值)
+    "background_weight": 0.5           # 背景类权重 (修改为平衡值)
 }
 
-# 数据集划分
-DATASET_CONFIG = {
-    "train_ratio": 0.8,
-    "val_ratio": 0.1,
-    "test_ratio": 0.1,
-    "random_seed": 44
-} 
+# 分割数据集路径 - 改为使用基于PROJECT_ROOT的绝对路径
+SEGMENTATION_PATHS = {
+    "img_dir": str(IMAGE_DIR),                    # 使用已定义的IMAGE_DIR
+    "mask_dir": str(SEGMENTATION_DIR),            # 使用已定义的SEGMENTATION_DIR
+    "crf_mask_dir": str(PSEUDO_MASK_DIR),         # 使用已定义的PSEUDO_MASK_DIR
+    "model_dir": str(SEGMENTOR_DIR),              # 使用已定义的SEGMENTOR_DIR
+    "result_dir": str(OUTPUT_ROOT / "results")    # 结果目录
+}
+
+# 全监督分割训练参数
+FULLY_SUP_CONFIG = {
+    "backbone": "resnet50",           # 使用的骨干网络
+    "atrous_rates": (6, 12, 18, 24),  # 空洞卷积率
+    "num_classes": 2,                 # 类别数量
+    "batch_size": 8,                  # 批量大小
+    "num_epochs": 10,                 # 训练轮次
+    "learning_rate": 1e-4,            # 学习率
+    "weight_decay": 1e-4,             # 权重衰减
+    "train_ratio": 0.8,               # 训练集比例
+    "test_ratio": 0.2,               # 测试集比例
+    "image_size": (224, 224),         # 图像大小
+    "eval_every": 1,                  # 每隔多少个epoch评估一次
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "num_workers": 4                  # 数据加载线程数
+}
+
+# 全监督分割路径
+FULLY_SUP_PATHS = {
+    "img_dir": str(IMAGE_DIR),                        # 使用已定义的IMAGE_DIR
+    "mask_dir": str(DATA_ROOT / "annotations/trimaps"),
+    "model_dir": str(MODEL_ROOT / "segmentor/fully_supervised"),
+    "result_dir": str(OUTPUT_ROOT / "results/fully_supervised")
+}

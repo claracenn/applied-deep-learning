@@ -4,11 +4,13 @@ import numpy as np
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
-import cv2  
+# import cv2  
+from PIL import Image, ImageFilter, ImageDraw
 from torch.utils.data import Dataset, DataLoader, random_split
 from pathlib import Path
 
-from config import FAST_TEST_CONFIG, CLASSIFIER_CONFIG
+# from config import FAST_TEST_CONFIG, CLASSIFIER_CONFIG
+from config import CLASSIFIER_CONFIG, TRAIN_FILE, TEST_FILE
 
 def set_seed(seed):
     """
@@ -65,26 +67,17 @@ class PetDataset(Dataset):
         transform: 图像转换管道
         is_training: 布尔值，指示数据集是否用于训练
         image_paths: 图像文件路径列表
-        cat_breeds: 猫品种名称列表
-        dog_breeds: 狗品种名称列表
+        labels_dict: 字典，将图像ID映射到标签(0表示猫，1表示狗)
     """
     
-    def __init__(self, image_dir, transform=None, is_training=True):
+    def __init__(self, image_dir, transform=None, is_training=True, labels_dict=None):
         self.image_dir = Path(image_dir)
         self.transform = transform
         self.is_training = is_training
-        self.image_paths = list(self.image_dir.glob('*.jpg'))
+        self.labels_dict = labels_dict or {}  # 如果没有提供标签字典，则使用空字典
         
-        self.cat_breeds = [
-            'Abyssinian', 'Bengal', 'Birman', 'Bombay', 'British', 'Egyptian', 'Maine', 
-            'Persian', 'Ragdoll', 'Russian', 'Siamese', 'Sphynx'
-        ]
-        self.dog_breeds = [
-            'american', 'basset', 'beagle', 'boxer', 'chihuahua', 'english', 'german', 
-            'great', 'japanese', 'keeshond', 'leonberger', 'miniature', 'newfoundland', 
-            'pomeranian', 'pug', 'saint', 'samoyed', 'scottish', 'shiba', 'staffordshire', 
-            'wheaten', 'yorkshire'
-        ]
+        # 获取所有图像文件路径
+        self.image_paths = list(self.image_dir.glob('*.jpg'))
         
     def __len__(self):
         """
@@ -111,13 +104,21 @@ class PetDataset(Dataset):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
         
+        # 获取文件名（不带扩展名）
         filename = img_path.stem
-        breed = filename.split('_')[0]
         
-        if any(breed.lower().startswith(cat.lower()) for cat in self.cat_breeds):
-            label = 0
+        # 如果有标签字典，则使用它
+        if filename in self.labels_dict:
+            # 标签值 1=猫, 2=狗，我们转换为 0=猫, 1=狗
+            species = self.labels_dict[filename]
+            label = species - 1  # 将1,2转换为0,1
         else:
-            label = 1
+            # 没有标签字典，则通过文件名判断
+            # 大写字母开头的是猫，小写字母开头的是狗
+            if filename[0].isupper():
+                label = 0  # 猫
+            else:
+                label = 1  # 狗
         
         if self.transform:
             image = self.transform(image)
@@ -128,220 +129,120 @@ class PetDataset(Dataset):
             'image_path': str(img_path)
         }
 
-def get_dataloaders(image_dir, batch_size=32, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1, seed=42, fast_test=None, config=None):
+def get_dataloaders(image_dir, batch_size=32, train_ratio=0.8, val_ratio=0.0, test_ratio=0.2, seed=42, config=None):
     """
-    创建数据加载器，应用性能优化
+    创建数据加载器，始终使用官方数据集划分
     
     参数:
         image_dir: 图像目录路径
         batch_size: 批量大小
-        train_ratio: 训练集比例
-        val_ratio: 验证集比例
-        test_ratio: 测试集比例
-        seed: 随机种子
-        fast_test: 快速测试模式
+        train_ratio, val_ratio, test_ratio, seed: 不再使用，仅为保持接口兼容
         config: 配置字典，包含优化参数
     
     返回:
-        tuple: (train_loader, val_loader, test_loader)
+        tuple: (train_loader, None, test_loader) - 第二个返回值为None，保持接口兼容
     """
     # 确保配置有效
     if config is None:
         from config import CLASSIFIER_CONFIG
         config = CLASSIFIER_CONFIG
     
-    # 提取数据加载优化参数
-    num_workers = config.get('num_workers', 4)  # 默认4个工作线程
-    pin_memory = config.get('pin_memory', True)  # 默认启用内存固定
-    prefetch_factor = config.get('prefetch_factor', 2)  # 数据预取因子
-    
-    # 预处理设置
-    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-    image_size = config.get('image_size', (224, 224))
-    
-    # 高效数据变换：减少预处理开销
-    transform = transforms.Compose([
-        transforms.Resize(int(image_size[0] * 1.1)),  # 稍微大一点的尺寸用于随机裁剪
-        transforms.CenterCrop(image_size),  # 使用中心裁剪替代随机裁剪
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std)
-    ])
-    
-    # 为每个集合创建数据集
-    image_dir = Path(image_dir)
-    dataset = PetDataset(image_dir, transform=transform)
-    
-    # 如果在快速测试模式，则限制样本数量
-    if fast_test:
-        max_samples = fast_test.get('max_samples', 100)
-        indices = torch.randperm(len(dataset))[:max_samples]
-        dataset = torch.utils.data.Subset(dataset, indices)
-    
-    # 拆分数据集
-    train_size = int(train_ratio * len(dataset))
-    val_size = int(val_ratio * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset, [train_size, val_size, test_size], 
-        generator=torch.Generator().manual_seed(seed)
-    )
-    
-    # 使用高效的数据加载器配置
-    train_loader = DataLoader(
-        train_dataset,
+    # 使用官方数据集划分
+    train_loader, test_loader = get_dataloaders_from_split(
+        image_dir=image_dir,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=(num_workers > 0),  # 保持工作线程活跃，减少创建开销
-        drop_last=True  # 丢弃最后一个不完整批次，避免不必要的计算
+        seed=seed,
+        config=config
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size * 2,  # 验证时使用更大批量，不需要反向传播
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=(num_workers > 0)
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size * 2,  # 测试时使用更大批量
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=(num_workers > 0)
-    )
-    
-    return train_loader, val_loader, test_loader
+    # 返回第二个元素为None，保持接口兼容
+    return train_loader, None, test_loader
 
 def visualize_cam(image, cam, save_path=None, alpha=0.5):
-    """
-    Visualize a Class Activation Map (CAM) over an image.
-    
-    Args:
-        image: Image tensor or numpy array
-        cam: Class activation map numpy array
-        save_path: Path to save the visualization
-        alpha: Transparency factor for overlay
-    """
     try:
-        # 如果需要，将张量转换为numpy
         if isinstance(image, torch.Tensor):
-            # 确保图像在CPU上
             image = image.cpu()
             mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
             image = image * std + mean
             image = image.permute(1, 2, 0).numpy()
             image = np.clip(image, 0, 1)
-        
-        # 将图像转换为uint8
+
         image_uint8 = (image * 255).astype(np.uint8)
-        
-        # 处理灰度图像
-        if len(image_uint8.shape) == 2:
-            image_uint8 = cv2.cvtColor(image_uint8, cv2.COLOR_GRAY2BGR)
-        elif image_uint8.shape[2] == 1:
-            image_uint8 = cv2.cvtColor(image_uint8, cv2.COLOR_GRAY2BGR)
-        
-        # 确保CAM形状正确且已归一化
-        h, w = image_uint8.shape[:2]
-        
-        # 调整CAM大小以匹配图像尺寸
-        cam_resized = cv2.resize(cam, (w, h))
-        cam_uint8 = (cam_resized * 255).astype(np.uint8)
-        
-        # 将CAM应用颜色映射
-        heatmap = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET)
-        
-        # 检查形状兼容性
-        if image_uint8.shape[:2] != heatmap.shape[:2]:
-            print(f"Shape mismatch: image={image_uint8.shape}, heatmap={heatmap.shape}")
-            return
-        
-        # 如果图像是RGB，则转换为BGR (OpenCV使用BGR)
-        if image_uint8.shape[2] == 3:
-            image_uint8_bgr = cv2.cvtColor(image_uint8, cv2.COLOR_RGB2BGR)
-        else:
-            image_uint8_bgr = image_uint8
-        
-        # 创建叠加图
-        overlay = cv2.addWeighted(image_uint8_bgr, 1-alpha, heatmap, alpha, 0)
-        
-        # 创建并排可视化
-        result = np.zeros((h, w*2, 3), dtype=np.uint8)
-        result[:, :w] = image_uint8_bgr
-        result[:, w:] = overlay
-        
-        # 添加标签
-        cv2.putText(result, 'Original Image', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(result, 'CAM Overlay', (w+10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        
-        # 保存或显示结果
+        pil_image = Image.fromarray(image_uint8).convert("RGB")
+        w, h = pil_image.size
+
+        cam_resized = Image.fromarray((cam * 255).astype(np.uint8)).resize((w, h)).convert("L")
+
+        # 将CAM映射为热图（简单替代色）
+        heatmap = Image.new("RGB", (w, h))
+        cam_array = np.array(cam_resized)
+        heat_array = np.zeros((h, w, 3), dtype=np.uint8)
+        heat_array[..., 0] = cam_array  # R
+        heat_array[..., 1] = cam_array // 2  # G
+        heatmap = Image.fromarray(heat_array)
+
+        # 叠加
+        overlay = Image.blend(pil_image, heatmap, alpha)
+
+        # 并排显示
+        total_width = w * 2
+        result = Image.new('RGB', (total_width, h))
+        result.paste(pil_image, (0, 0))
+        result.paste(overlay, (w, 0))
+
+        # 添加文字
+        draw = ImageDraw.Draw(result)
+        draw.text((10, 10), "Original Image", fill=(255, 255, 255))
+        draw.text((w + 10, 10), "CAM Overlay", fill=(255, 255, 255))
+
         if save_path:
-            save_dir = Path(save_path).parent
-            save_dir.mkdir(exist_ok=True, parents=True)
-            cv2.imwrite(str(save_path), result)
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            result.save(save_path)
         else:
-            cv2.imshow('CAM Visualization', result)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
+            result.show()
+
     except Exception as e:
         print(f"Error in visualize_cam: {e}")
-        # Try to save a grayscale version as fallback
         try:
-            cv2.imwrite(str(save_path), cam_uint8)
-            print(f"Saved alternative grayscale CAM to {save_path}")
+            Image.fromarray((cam * 255).astype(np.uint8)).save(save_path)
         except Exception as e2:
-            print(f"Alternative method also failed: {e2}")
+            print(f"Fallback save also failed: {e2}")
 
 def save_cam(image_path, cam, save_dir, file_suffix='_cam'):
-    """
-    Save a CAM visualization for a given image.
-    
-    Args:
-        image_path: Path to the input image
-        cam: Class activation map
-        save_dir: Directory to save the visualization
-        file_suffix: Suffix to add to the file name
-    """
     save_dir = Path(save_dir)
     save_dir.mkdir(exist_ok=True, parents=True)
-    
+
     image_path = Path(image_path)
     save_path = save_dir / f"{image_path.stem}{file_suffix}.png"
-    
+
     try:
-        image = cv2.imread(str(image_path))
-        if image is None:
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except:
             h, w = cam.shape
-            image = np.zeros((h, w, 3), dtype=np.uint8)
-        
-        h, w = image.shape[:2]
-        cam_resized = cv2.resize(cam, (w, h))
-        cam_uint8 = (cam_resized * 255).astype(np.uint8)
-        
-        heatmap = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET)
-        
-        assert image.shape == heatmap.shape, f"Shape mismatch: image={image.shape}, heatmap={heatmap.shape}"
-        
-        overlay = cv2.addWeighted(image, 0.5, heatmap, 0.5, 0)
-        
-        cv2.imwrite(str(save_path), overlay)
-        
+            image = Image.new("RGB", (w, h), color=(0, 0, 0))
+
+        cam_resized = Image.fromarray((cam * 255).astype(np.uint8)).resize(image.size).convert("L")
+
+        cam_array = np.array(cam_resized)
+        heat_array = np.zeros((image.size[1], image.size[0], 3), dtype=np.uint8)
+        heat_array[..., 0] = cam_array
+        heat_array[..., 1] = cam_array // 2
+        heatmap = Image.fromarray(heat_array)
+
+        overlay = Image.blend(image, heatmap, alpha=0.5)
+        overlay.save(save_path)
+
         return save_path
+
     except Exception as e:
         print(f"Failed to save CAM visualization: {e}")
         cam_uint8 = (cam * 255).astype(np.uint8)
-        cv2.imwrite(str(save_path), cam_uint8)
-        return save_path 
+        Image.fromarray(cam_uint8).save(save_path)
+        return save_path
+
+
 
 def get_cam_dataloaders(dataset, batch_size=8):
     """创建专用于CAM生成的DataLoader"""
@@ -353,3 +254,138 @@ def get_cam_dataloaders(dataset, batch_size=8):
         pin_memory=True,
         drop_last=False  # 确保处理所有图像
     ) 
+
+def load_dataset_split():
+    """
+    加载官方的数据集划分，只有训练集和测试集
+    解析每行格式为: "Image_name CLASS-ID SPECIES BREED_ID"
+    
+    返回:
+        dict: 包含train_ids和test_ids的字典，以及对应的标签
+    """
+    if not TRAIN_FILE.exists() or not TEST_FILE.exists():
+        print(f"Warning: Dataset split files not found at {TRAIN_FILE} or {TEST_FILE}")
+        return None
+    
+    # 加载trainval.txt作为训练集
+    train_ids = []
+    train_labels = {}
+    with open(TRAIN_FILE, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue  # 跳过注释和空行
+                
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                img_id = parts[0]  # 图像名称
+                species = int(parts[2])  # SPECIES: 1=猫, 2=狗
+                train_ids.append(img_id)
+                train_labels[img_id] = species
+    
+    # 加载test.txt作为测试集
+    test_ids = []
+    test_labels = {}
+    with open(TEST_FILE, 'r') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue  # 跳过注释和空行
+                
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                img_id = parts[0]  # 图像名称
+                species = int(parts[2])  # SPECIES: 1=猫, 2=狗
+                test_ids.append(img_id)
+                test_labels[img_id] = species
+    
+    print(f"Dataset split: {len(train_ids)} training images, {len(test_ids)} test images")
+    
+    return {
+        'train_ids': train_ids,
+        'test_ids': test_ids,
+        'train_labels': train_labels,
+        'test_labels': test_labels
+    }
+
+def get_dataloaders_from_split(image_dir, batch_size=32, seed=42, config=None):
+    """
+    根据官方数据集划分创建数据加载器，只包含训练集和测试集
+    
+    参数:
+        image_dir: 图像目录路径
+        batch_size: 批量大小
+        seed: 随机种子
+        config: 配置字典，包含优化参数
+    
+    返回:
+        tuple: (train_loader, test_loader)
+    """
+    # 确保配置有效
+    if config is None:
+        from config import CLASSIFIER_CONFIG
+        config = CLASSIFIER_CONFIG
+    
+    # 获取数据集划分
+    splits = load_dataset_split()
+    if splits is None:
+        print("Warning: Using random split instead of official split")
+        # 使用8:2的分割
+        train_loader, _, test_loader = get_dataloaders(
+            image_dir=image_dir, 
+            batch_size=batch_size,
+            train_ratio=0.8,
+            val_ratio=0,
+            test_ratio=0.2,
+            seed=seed,
+            config=config
+        )
+        return train_loader, test_loader
+    
+    # 提取数据加载优化参数
+    num_workers = config.get('num_workers', 4)
+    pin_memory = config.get('pin_memory', True)
+    prefetch_factor = config.get('prefetch_factor', 2)
+    
+    # 预处理设置
+    transform = get_transform(is_training=True, size=config.get('image_size', (224, 224)))
+    eval_transform = get_transform(is_training=False, size=config.get('image_size', (224, 224)))
+    
+    # 创建图像文件名到文件路径的映射
+    image_dir = Path(image_dir)
+    image_paths = list(image_dir.glob('*.jpg'))
+    image_dict = {path.stem: path for path in image_paths}
+    
+    # 创建训练集和测试集的图像路径列表
+    train_paths = [image_dict[img_id] for img_id in splits['train_ids'] if img_id in image_dict]
+    test_paths = [image_dict[img_id] for img_id in splits['test_ids'] if img_id in image_dict]
+    
+    # 创建训练集和测试集
+    train_dataset = PetDataset(image_dir, transform=transform, labels_dict=splits['train_labels'])
+    train_dataset.image_paths = train_paths
+    
+    test_dataset = PetDataset(image_dir, transform=eval_transform, is_training=False, labels_dict=splits['test_labels'])
+    test_dataset.image_paths = test_paths
+    
+    # 创建数据加载器
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=(num_workers > 0),
+        drop_last=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size * 2,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=(num_workers > 0)
+    )
+    
+    print(f"DataLoaders created: {len(train_dataset)} train, {len(test_dataset)} test")
+    return train_loader, test_loader 
