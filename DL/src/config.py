@@ -198,3 +198,31 @@ FULLY_SUP_PATHS = {
     "model_dir": str(MODEL_ROOT / "segmentor/fully_supervised"),
     "result_dir": str(OUTPUT_ROOT / "results/fully_supervised")
 }
+
+# ScoreNet training parameters
+SCORNET_CONFIG = {
+    "epochs": 20,
+    "lr": 0.001,
+    "batch_size": 8,
+    "patience": 5,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "save_path": "models/scorenet/scorenet.pth",
+    "input_size": (224, 224),
+    "image_dir": "data/images",
+    "cam_dir": "outputs/cams"
+}
+
+FAST_TEST_CONFIG = {
+    "enabled": False, 
+    "max_samples": 50,  # 最大样本数量
+    "epochs": 1,        # 训练轮次
+    "batch_size": 16    # 批量大小
+}
+
+# 数据集划分
+DATASET_CONFIG = {
+    "train_ratio": 0.8,
+    "val_ratio": 0.1,
+    "test_ratio": 0.1,
+    "random_seed": 44
+}
