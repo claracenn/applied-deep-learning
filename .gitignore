@@ -27,3 +27,4 @@ DL/生成数据.zip
 
 *.zip
 DL/models/classifier/*.pth
+DL/models/classifier/*.pth
