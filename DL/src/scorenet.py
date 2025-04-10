@@ -4,25 +4,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 import numpy as np
 
-from config import SCORNET_CONFIG
 
-
-# ScoreNet Model Definition
 class ScoreNet(nn.Module):
     """
-    ScoreNet generates pixel-level confidence maps.
+    ScoreNet用于生成像素级置信度图。
     
-    Inputs: 
-        image: [B, 3, H, W] normalized original image.
-        cam:   [B, 1, H, W] CAM obtained from the CAM extractor.
+    输入: 
+        image: [B, 3, H, W] 原始图像（归一化后）
+        cam:   [B, 1, H, W] 由CAM提取器获得的类激活图
         
-    Output:
-        confidence_map: [B, 1, H, W] with values in the range [0,1].
+    输出:
+        confidence_map: [B, 1, H, W] 像素级置信度图，值在 [0,1] 之间
     """
     def __init__(self, in_channels=4, base_channels=16):
         super(ScoreNet, self).__init__()
@@ -41,8 +38,7 @@ class ScoreNet(nn.Module):
         self.conv5 = nn.Conv2d(base_channels, 1, kernel_size=1)
     
     def forward(self, image, cam):
-        # Concatenate image and CAM to form a 4-channel input.
-        x = torch.cat([image, cam], dim=1) 
+        x = torch.cat([image, cam], dim=1)  # 拼接成4通道输入
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
@@ -50,37 +46,35 @@ class ScoreNet(nn.Module):
         x = self.conv5(x)
         return torch.sigmoid(x)
 
-
-# Dataset Definition
 class ScoreNetDataset(Dataset):
     def __init__(self, image_dir, cam_dir, transform=None):
         """
-        image_dir: Directory of original images (e.g., "data/images").
-        cam_dir: Directory where CAM files are stored (e.g., "outputs/cams").
-        transform: Preprocessing for images (recommended: resize to ScoreNet input size).
+        image_dir: 原始图像所在目录，如 "data/images"
+        cam_dir: CAM文件存放目录，如 "outputs/cams"
+        transform: 图像预处理（建议 resize 到 ScoreNet 需要的尺寸，例如 (224,224)）
         """
         self.image_dir = image_dir
         self.cam_dir = cam_dir
         self.transform = transform
 
-        # List all image files in image_dir 
+        # 列出 image_dir 下所有图像文件（支持 jpg/png/jpeg）
         self.image_paths = []
         for ext in ("*.jpg", "*.png", "*.jpeg"):
             self.image_paths.extend(glob.glob(os.path.join(image_dir, ext)))
         self.image_paths = sorted(self.image_paths)
 
-        # Build a dictionary for CAM files
+        # 构建一个 CAM 文件字典，key 为小写的图像基本名（不含 _cam），value 为完整的 CAM 文件路径
         self.cam_files = {}
         for file in glob.glob(os.path.join(cam_dir, "*.npy")):
             stem = os.path.splitext(os.path.basename(file))[0]
             stem_lower = stem.lower()
             if stem_lower.endswith("_cam"):
-                key = stem_lower[:-4]  
+                key = stem_lower[:-4]  # 去掉 "_cam"
             else:
                 key = stem_lower
             self.cam_files[key] = file
 
-        # Filter out images that do not have a corresponding CAM file
+        # 过滤掉那些没有对应 CAM 文件的图像
         valid_images = []
         for image_path in self.image_paths:
             base_name = os.path.splitext(os.path.basename(image_path))[0].lower()
@@ -94,7 +88,7 @@ class ScoreNetDataset(Dataset):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        # Load image
+        # 加载图像
         image_path = self.image_paths[idx]
         image = Image.open(image_path).convert("RGB")
         if self.transform:
@@ -102,59 +96,30 @@ class ScoreNetDataset(Dataset):
         else:
             image_tensor = transforms.ToTensor()(image)
         
-        # Determine corresponding CAM file case-insensitive
+        # 根据图像文件名推断对应的 CAM 文件（大小写不敏感）
         base_name = os.path.splitext(os.path.basename(image_path))[0].lower()
         cam_file = self.cam_files[base_name]
         cam_array = np.load(cam_file)
         cam_tensor = torch.from_numpy(cam_array).float().unsqueeze(0)
-        # Generate binary pseudo-target from cam > 0.5
+        # 使用 cam > 0.5 得到二值伪监督目标
         target_conf = (cam_tensor > 0.5).float()
         return {"image": image_tensor, "cam": cam_tensor, "target_conf": target_conf}
 
 
-# Evaluation Function for ScoreNet: Computes BCE loss and pixel accuracy
-def evaluate_scorenet(model, dataloader, device):
-    model.eval()
-    criterion = nn.BCELoss()
-    total_loss = 0.0
-    total_pixels = 0
-    correct_pixels = 0
-    with torch.no_grad():
-        for batch in dataloader:
-            images = batch["image"].to(device)    
-            cams = batch["cam"].to(device)         
-            targets = batch["target_conf"].to(device) 
-            outputs = model(images, cams)         
-            loss = criterion(outputs, targets)
-            total_loss += loss.item() * images.size(0)
-            preds = (outputs > 0.5).float()
-            correct_pixels += (preds == targets).sum().item()
-            total_pixels += targets.numel()
-    avg_loss = total_loss / len(dataloader.dataset)
-    pixel_accuracy = correct_pixels / total_pixels * 100
-    return avg_loss, pixel_accuracy
 
-
-# Train ScoreNet Function with Validation, Best-Model Saving, and Early Stopping
-def train_scorenet(train_loader, val_loader, config):
-    device = torch.device(config["device"])
+def train_scorenet(train_loader, epochs=10, device="cuda", lr=1e-3, save_path="models/scorenet/scorenet.pth"):
+    device = torch.device(device)
     model = ScoreNet(in_channels=4, base_channels=16).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.BCELoss()
     
-    best_val_loss = float('inf')
-    epochs_without_improvement = 0
-    epochs = config["epochs"]
-    patience = config["patience"]
-    save_path = config["save_path"]
-    
+    model.train()
     for epoch in range(epochs):
-        model.train()
         total_loss = 0.0
         for batch in train_loader:
-            images = batch["image"].to(device)
-            cams = batch["cam"].to(device)
-            targets = batch["target_conf"].to(device)
+            images = batch["image"].to(device)    # [B, 3, H, W]
+            cams = batch["cam"].to(device)          # [B, 1, H, W]
+            targets = batch["target_conf"].to(device) # [B, 1, H, W]
             
             optimizer.zero_grad()
             outputs = model(images, cams)
@@ -163,58 +128,38 @@ def train_scorenet(train_loader, val_loader, config):
             optimizer.step()
             total_loss += loss.item() * images.size(0)
         
-        avg_train_loss = total_loss / len(train_loader.dataset)
-        print(f"Epoch [{epoch+1}/{epochs}] Training Loss: {avg_train_loss:.4f}")
-        
-        # Validation phase
-        val_loss, val_accuracy = evaluate_scorenet(model, val_loader, device)
-        print(f"Epoch [{epoch+1}/{epochs}] Validation Loss: {val_loss:.4f}, Pixel Accuracy: {val_accuracy:.2f}%")
-        
-        # Check for improvement and apply early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_without_improvement = 0
-            print(f"Validation loss improved, saving model to {save_path}")
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            torch.save(model.state_dict(), save_path)
-        else:
-            epochs_without_improvement += 1
-            print(f"No improvement for {epochs_without_improvement} epoch(s)")
-        
-        if epochs_without_improvement >= patience:
-            print(f"Early stopping triggered at epoch {epoch+1}")
-            break
+        avg_loss = total_loss / len(train_loader.dataset)
+        print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.4f}")
     
-    return model
+    # 确保保存目录存在
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(model.state_dict(), save_path)
+    print(f"ScoreNet model saved to {save_path}")
 
 
 if __name__ == "__main__":
-    # Load config
-    config = SCORNET_CONFIG
-    device = config["device"]
-    input_size = config["input_size"]
+    # 参数设置
+    EPOCHS = 10
+    LR = 0.001
+    BATCH_SIZE = 8
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    SAVE_PATH = "models/scorenet/scorenet.pth"
     
-    # Define image preprocessing: resize to input_size and normalize
+    # 数据路径设置（根据 README，图像在 data/images，CAM 在 outputs/cams）
+    IMAGE_DIR = "data/images"
+    CAM_DIR = "outputs/cams"
+    
+    # 图像预处理（假设统一调整到 224x224，并归一化）
     transform = transforms.Compose([
-        transforms.Resize(input_size),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
     ])
     
-    # Create dataset and split it into training and validation sets
-    dataset = ScoreNetDataset(image_dir=config["image_dir"], cam_dir=config["cam_dir"], transform=transform)
-    total_samples = len(dataset)
-    train_size = int(0.8 * total_samples)
-    val_size = total_samples - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # 创建数据集和数据加载器
+    dataset = ScoreNetDataset(image_dir=IMAGE_DIR, cam_dir=CAM_DIR, transform=transform)
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
     
-    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=4)
-    
-    # Train ScoreNet with validation and early stopping
-    model = train_scorenet(train_loader, val_loader, config)
-    
-    # Final evaluation on the validation set
-    final_loss, final_accuracy = evaluate_scorenet(model, val_loader, device)
-    print(f"Final Validation Loss: {final_loss:.4f}, Pixel Accuracy: {final_accuracy:.2f}%")
+    # 训练 ScoreNet
+    train_scorenet(train_loader, epochs=EPOCHS, device=DEVICE, lr=LR, save_path=SAVE_PATH)
