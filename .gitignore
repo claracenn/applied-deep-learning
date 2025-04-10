@@ -26,3 +26,4 @@ DL/生成数据.zip
 !DL/models/segmentor/fully_supervised/.gitkeep
 
 *.zip
+DL/models/classifier/*.pth
