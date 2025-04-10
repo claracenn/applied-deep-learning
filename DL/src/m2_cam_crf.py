@@ -298,13 +298,23 @@ def process_cam_with_crf(cam_path, image_dir, output_dir, crf_config=None):
     try:
         mask = apply_crf(image, cam, crf_config)
         
-        # 保存结果
+        # 1. 保存原始二值掩码 (0和1)
         output_path = Path(output_dir) / f"{base_name}.png"
-        # 使用PIL保存图像
-        mask_img = Image.fromarray((mask * 255).astype(np.uint8))
-        mask_img.save(str(output_path))
+        # 确保保存的是二值掩码，值为0和1
+        img = Image.fromarray(mask)
+        img.save(str(output_path))
         
-        print(f"Processed: {base_name}")
+        # 2. 保存可视化版掩码 (0和255)
+        vis_dir = Path(output_dir).parent / "vis_pseudo"
+        os.makedirs(vis_dir, exist_ok=True)
+        vis_path = vis_dir / f"{base_name}.png"
+        vis_img = Image.fromarray((mask * 255).astype(np.uint8))
+        vis_img.save(str(vis_path))
+        
+        # 计算并打印前景比例
+        foreground_ratio = np.mean(mask) * 100
+        print(f"Processed: {base_name}, foreground ratio: {foreground_ratio:.2f}%")
+        
         return True
     except Exception as e:
         print(f"Error processing {base_name}: {e}")

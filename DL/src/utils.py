@@ -169,11 +169,17 @@ def visualize_cam(image, cam, save_path=None, alpha=0.5):
             image = image.permute(1, 2, 0).numpy()
             image = np.clip(image, 0, 1)
 
+        # Ensure cam is a valid numpy array with values in [0, 1]
+        if isinstance(cam, torch.Tensor):
+            cam = cam.cpu().numpy()
+        cam = np.clip(cam, 0, 1)
+
         image_uint8 = (image * 255).astype(np.uint8)
         pil_image = Image.fromarray(image_uint8).convert("RGB")
         w, h = pil_image.size
 
-        cam_resized = Image.fromarray((cam * 255).astype(np.uint8)).resize((w, h)).convert("L")
+        cam_uint8 = (cam * 255).astype(np.uint8)
+        cam_resized = Image.fromarray(cam_uint8).resize((w, h)).convert("L")
 
         # 将CAM映射为热图（简单替代色）
         heatmap = Image.new("RGB", (w, h))
@@ -193,22 +199,33 @@ def visualize_cam(image, cam, save_path=None, alpha=0.5):
         result.paste(overlay, (w, 0))
 
         # 添加文字
-        draw = ImageDraw.Draw(result)
-        draw.text((10, 10), "Original Image", fill=(255, 255, 255))
-        draw.text((w + 10, 10), "CAM Overlay", fill=(255, 255, 255))
+        try:
+            draw = ImageDraw.Draw(result)
+            draw.text((10, 10), "Original Image", fill=(255, 255, 255))
+            draw.text((w + 10, 10), "CAM Overlay", fill=(255, 255, 255))
+        except Exception as text_error:
+            print(f"Could not add text to image: {text_error}")
 
         if save_path:
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
             result.save(save_path)
+            print(f"Saved visualization to {save_path}")
+            return True
         else:
             result.show()
+            return True
 
     except Exception as e:
         print(f"Error in visualize_cam: {e}")
         try:
-            Image.fromarray((cam * 255).astype(np.uint8)).save(save_path)
+            if save_path:
+                cam_uint8 = (cam * 255).astype(np.uint8)
+                Image.fromarray(cam_uint8).save(save_path)
+                print(f"Saved fallback image to {save_path}")
+                return True
         except Exception as e2:
             print(f"Fallback save also failed: {e2}")
+        return False
 
 def save_cam(image_path, cam, save_dir, file_suffix='_cam'):
     save_dir = Path(save_dir)

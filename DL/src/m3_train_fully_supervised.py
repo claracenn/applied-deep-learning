@@ -38,7 +38,10 @@ from m3_train_segmentation import (
 )
 
 # 导入配置
-from config import FULLY_SUP_CONFIG, FULLY_SUP_PATHS, PROJECT_ROOT, DATA_ROOT
+from config import (
+    FULLY_SUP_CONFIG, FULLY_SUP_PATHS, PROJECT_ROOT, DATA_ROOT, 
+    ANNOTATION_DIR, IMAGE_DIR, OUTPUT_ROOT, MODEL_ROOT
+)
 
 # 添加加载官方数据集划分的函数
 def load_official_dataset_split(trainval_file, test_file, test_ratio=0.2, seed=42):
@@ -138,11 +141,21 @@ class FullySupSegDataset(Dataset):
                         self.mask_paths.append(self.mask_dir / mask_file)
                         break
 
+        # 验证图像和掩码对
         valid_indices = []
         for i, (img_path, mask_path) in enumerate(zip(self.image_paths, self.mask_paths)):
             try:
-                img = Image.open(img_path).convert("RGB")
-                mask = Image.open(mask_path).convert("L")
+                # 确保文件存在
+                if not os.path.exists(str(img_path)) or not os.path.exists(str(mask_path)):
+                    raise FileNotFoundError(f"File not found: {img_path} or {mask_path}")
+                
+                # 尝试打开图像和掩码
+                with Image.open(str(img_path)) as img:
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                with Image.open(str(mask_path)) as mask:
+                    if mask.mode != "L":
+                        mask = mask.convert("L")
                 valid_indices.append(i)
             except Exception as e:
                 print(f"Error: Skipping corrupted pair {img_path}, {mask_path}: {e}")
@@ -155,43 +168,81 @@ class FullySupSegDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        mask_path = self.mask_paths[idx]
-
+        # 防止索引越界
+        if idx >= len(self.image_paths):
+            print(f"Warning: Index {idx} out of bounds, returning dummy sample")
+            return self._get_dummy_sample()
+            
         try:
-            image = Image.open(img_path).convert("RGB")
-            mask = Image.open(mask_path).convert("L")
+            # 使用字符串路径打开文件
+            img_path = str(self.image_paths[idx])
+            mask_path = str(self.mask_paths[idx])
+            
+            # 确保文件存在
+            if not os.path.exists(img_path) or not os.path.exists(mask_path):
+                print(f"Warning: Files not found at index {idx}, returning dummy sample")
+                return self._get_dummy_sample()
 
-            mask_np = np.array(mask)
-            if np.max(mask_np) > 1:
-                binary_mask = np.zeros_like(mask_np)
-                binary_mask[mask_np > 1] = 1
-                mask_np = binary_mask
+            # 打开图像为RGB模式
+            with Image.open(img_path) as img:
+                # 始终转换为RGB以确保一致性
+                image = img.convert("RGB")
 
-            if self.transform:
-                image = self.transform(image)
+            # 打开掩码为灰度模式
+            with Image.open(mask_path) as mask_img:
+                # 始终转换为L以确保一致性
+                mask_pil = mask_img.convert("L")
+                # 转为numpy以进行处理
+                mask_np = np.array(mask_pil)
+            
+            # 处理trimap值 - 创建二值掩码
+            binary_mask = np.zeros_like(mask_np)
+            binary_mask[mask_np == 1] = 1  # 前景
+            binary_mask[mask_np == 2] = 0  # 背景
+            binary_mask[mask_np == 3] = 255  # 未分类区域
+            
+            # 将numpy掩码转回PIL图像用于变换
+            binary_mask_pil = Image.fromarray(binary_mask.astype(np.uint8))
+            
+            # 应用图像变换 - 直接在PIL图像上操作
+            if self.transform is not None:
+                try:
+                    image = self.transform(image)
+                except Exception as e:
+                    print(f"Error applying transform to image: {e}")
+                    return self._get_dummy_sample()
+
+            # 应用掩码变换 - 直接在PIL图像上操作
+            if self.mask_transform is not None:
+                try:
+                    mask_tensor = self.mask_transform(binary_mask_pil)
+                except Exception as e:
+                    print(f"Error applying transform to mask: {e}")
+                    return self._get_dummy_sample()
             else:
-                image = transforms.ToTensor()(image)
+                # 没有变换，直接转为tensor
+                mask_tensor = torch.from_numpy(binary_mask).long()
 
-            if self.mask_transform:
-                mask_tensor = self.mask_transform(mask_np)
-                if mask_tensor.dim() > 2:
-                    mask_tensor = mask_tensor.squeeze()
-            else:
-                mask_tensor = torch.from_numpy(mask_np).long()
+            # 确保掩码是2D的 [H, W]
+            if mask_tensor.dim() > 2:
+                mask_tensor = mask_tensor.squeeze(0)
 
-            return {"image": image, "mask": mask_tensor, "path": str(img_path)}
+            return {"image": image, "mask": mask_tensor, "path": img_path}
 
         except Exception as e:
             print(f"Error loading index {idx}: {e}")
-            dummy_image = torch.zeros(3, 224, 224)
-            dummy_mask = torch.zeros((224, 224), dtype=torch.long)
-            return {"image": dummy_image, "mask": dummy_mask, "path": str(img_path)}
+            return self._get_dummy_sample()
+    
+    def _get_dummy_sample(self):
+        """创建一个有效的替代样本"""
+        dummy_image = torch.zeros(3, 224, 224)
+        dummy_mask = torch.zeros(224, 224, dtype=torch.long)
+        return {"image": dummy_image, "mask": dummy_mask, "path": "dummy_path"}
 
 # 添加计算批次间IoU的函数
 def compute_batch_miou(preds, targets, num_classes=2):
     """
-    计算批次中的平均交并比(mIoU)
+    计算批次中的平均交并比(mIoU)，忽略标记为255的区域
     
     Args:
         preds: 形状为(B, H, W)的预测掩码
@@ -211,10 +262,14 @@ def compute_batch_miou(preds, targets, num_classes=2):
     intersection = np.zeros(num_classes)
     union = np.zeros(num_classes)
     
+    # 创建有效区域掩码，忽略值为255的区域
+    valid_mask = (targets != 255)
+    
     # 对每个类别计算IoU
     for cls in range(num_classes):
-        pred_inds = (preds == cls)
-        target_inds = (targets == cls)
+        # 只在有效区域内计算
+        pred_inds = (preds == cls) & valid_mask
+        target_inds = (targets == cls) & valid_mask
         
         # 计算交集和并集
         intersection[cls] = np.logical_and(pred_inds, target_inds).sum()
@@ -228,6 +283,47 @@ def compute_batch_miou(preds, targets, num_classes=2):
     
     # 返回所有类别的平均IoU
     return np.mean(iou)
+
+# 添加计算每个类别IoU的函数
+def calculate_per_class_iou(preds, targets, num_classes=2):
+    """
+    计算每个类别的IoU
+    
+    Args:
+        preds: 预测掩码 (numpy array或tensor)
+        targets: 真实掩码 (numpy array或tensor)
+        num_classes: 类别数量
+        
+    Returns:
+        numpy array: 每个类别的IoU
+    """
+    # 确保输入是numpy数组
+    if not isinstance(preds, np.ndarray):
+        preds = preds.cpu().numpy()
+    if not isinstance(targets, np.ndarray):
+        targets = targets.cpu().numpy()
+    
+    # 创建有效区域掩码，忽略值为255的区域
+    valid_mask = (targets != 255)
+    
+    # 初始化每个类别的IoU
+    class_ious = np.zeros(num_classes)
+    
+    # 计算每个类别的IoU
+    for cls in range(num_classes):
+        # 只在有效区域内计算
+        pred_cls = (preds == cls) & valid_mask
+        target_cls = (targets == cls) & valid_mask
+        
+        # 计算交集和并集
+        intersection = np.logical_and(pred_cls, target_cls).sum()
+        union = np.logical_or(pred_cls, target_cls).sum()
+        
+        # 计算IoU，避免除零
+        if union > 0:
+            class_ious[cls] = intersection / union
+    
+    return class_ious
 
 # 训练函数
 def train_model(model, train_loader, test_loader, criterion, optimizer, config, paths, model_type="fully_supervised"):
@@ -254,8 +350,14 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
         "test_loss": [],
         "train_miou": [],
         "test_miou": [],
+        "val_miou": [],  # 添加验证集的mIoU
+        "test_class_ious": [],  # 添加每个类别的IoU
         "best_miou": 0.0,
+        "lr": []  # 记录学习率
     }
+    
+    # 获取scheduler
+    scheduler = config.get("scheduler", None)
     
     # 确保模型目录存在
     os.makedirs(paths["model_dir"], exist_ok=True)
@@ -275,6 +377,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
     print(f"Number of epochs: {config['num_epochs']}")
     print(f"Number of training samples: {len(train_loader.dataset)}")
     print(f"Number of testing samples: {len(test_loader.dataset)}")
+    print(f"Initial learning rate: {config['learning_rate']}")
     
     # 开始训练循环
     for epoch in range(config["num_epochs"]):
@@ -294,11 +397,26 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
             # 前向传播
             outputs = model(images)
             
-            # 计算损失
-            loss = criterion(outputs, masks)
+            # 处理模型输出 - 可能是元组(main_output, aux_output)
+            if isinstance(outputs, tuple):
+                main_output, aux_output = outputs
+                # 计算主要损失和辅助损失
+                main_loss = criterion(main_output, masks)
+                aux_loss = criterion(aux_output, masks)
+                # 综合损失 - 主要损失占比0.7，辅助损失占比0.3
+                loss = 0.7 * main_loss + 0.3 * aux_loss
+                # 使用主要输出进行评估
+                preds = torch.argmax(main_output, dim=1)
+            else:
+                # 单一输出的情况
+                loss = criterion(outputs, masks)
+                preds = torch.argmax(outputs, dim=1)
             
             # 反向传播
             loss.backward()
+            
+            # 梯度裁剪，防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             # 更新参数
             optimizer.step()
@@ -307,7 +425,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
             train_loss += loss.item() * images.size(0)
             
             # 计算mIoU
-            preds = torch.argmax(outputs, dim=1)
             iou = compute_batch_miou(preds.cpu(), masks.cpu(), config["num_classes"])
             train_iou_sum += iou * images.size(0)
             num_samples += images.size(0)
@@ -330,6 +447,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
         test_loss = 0.0
         test_iou_sum = 0.0
         num_samples = 0
+        class_ious_sum = np.zeros(config["num_classes"])  # 累积每个类别的IoU
         
         with torch.no_grad():
             for i, batch in enumerate(test_loader):
@@ -339,16 +457,26 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
                 # 前向传播
                 outputs = model(images)
                 
-                # 计算损失
-                loss = criterion(outputs, masks)
+                # 处理模型输出 - 在eval模式下应该只有一个输出，但为了安全起见还是处理一下
+                if isinstance(outputs, tuple):
+                    main_output = outputs[0]  # 取主要输出
+                    loss = criterion(main_output, masks)
+                    preds = torch.argmax(main_output, dim=1)
+                else:
+                    loss = criterion(outputs, masks)
+                    preds = torch.argmax(outputs, dim=1)
                 
                 # 更新统计信息
                 test_loss += loss.item() * images.size(0)
                 
                 # 计算mIoU
-                preds = torch.argmax(outputs, dim=1)
                 iou = compute_batch_miou(preds.cpu(), masks.cpu(), config["num_classes"])
                 test_iou_sum += iou * images.size(0)
+                
+                # 计算每个类别的IoU
+                class_ious = calculate_per_class_iou(preds.cpu(), masks.cpu(), config["num_classes"])
+                class_ious_sum += class_ious * images.size(0)
+                
                 num_samples += images.size(0)
                 
                 # 显示进度
@@ -363,19 +491,38 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
         # 计算平均损失和mIoU
         avg_test_loss = test_loss / num_samples
         avg_test_miou = test_iou_sum / num_samples
+        avg_class_ious = class_ious_sum / num_samples
+        
+        # 将测试集的mIoU同时作为验证集的mIoU (因为我们没有单独的验证集)
+        avg_val_miou = avg_test_miou
         
         # 更新日志
         log["train_loss"].append(avg_train_loss)
         log["test_loss"].append(avg_test_loss)
         log["train_miou"].append(avg_train_miou)
         log["test_miou"].append(avg_test_miou)
+        log["val_miou"].append(avg_val_miou)  # 添加验证集mIoU
+        log["test_class_ious"].append(avg_class_ious.tolist())  # 保存每个类别的IoU
         
-        # 打印本轮结果
+        # 记录当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        log["lr"].append(current_lr)
+        
+        # 打印本轮结果，包含验证集mIoU
         print(f"Epoch {epoch+1}/{config['num_epochs']} - "
               f"Train Loss: {avg_train_loss:.4f}, "
               f"Train mIoU: {avg_train_miou:.4f}, "
-              f"Test Loss: {avg_test_loss:.4f}, "
-              f"Test mIoU: {avg_test_miou:.4f}")
+              f"Val Loss: {avg_test_loss:.4f}, "
+              f"Val mIoU: {avg_val_miou:.4f}, "
+              f"Test mIoU: {avg_test_miou:.4f}, "
+              f"LR: {current_lr:.6f}")
+        
+        # 打印每个类别的IoU
+        class_names = ["背景", "前景"]
+        print(f"类别IoU: ", end="")
+        for i, class_iou in enumerate(avg_class_ious):
+            print(f"{class_names[i]}: {class_iou:.4f}", end="  ")
+        print()
         
         # 保存最佳模型
         if avg_test_miou > best_miou:
@@ -387,8 +534,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
             torch.save(model.state_dict(), best_model_path)
             print(f"Best model saved with mIoU: {best_miou:.4f}")
         
-        # 学习率衰减（可选）
-        # scheduler.step()
+        # 学习率调度
+        if scheduler is not None:
+            scheduler.step()
+            print(f"Learning rate adjusted to: {optimizer.param_groups[0]['lr']:.6f}")
     
     # 计算总训练时间
     training_time = time.time() - start_time
@@ -403,8 +552,11 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, config, 
             "train_loss": log["train_loss"],
             "test_loss": log["test_loss"],
             "train_miou": log["train_miou"],
+            "val_miou": log["val_miou"],  # 添加验证集mIoU
             "test_miou": log["test_miou"],
+            "test_class_ious": log["test_class_ious"],  # 添加每个类别的IoU
             "best_miou": log["best_miou"],
+            "lr": log["lr"],
             "best_epoch": best_epoch,
             "total_epochs": config["num_epochs"],
             "training_time_minutes": training_time / 60,
@@ -479,7 +631,6 @@ def load_weakly_supervised_results(result_dir=None):
     """
     if result_dir is None:
         # 使用config中定义的结果目录
-        from config import OUTPUT_ROOT
         result_dir = str(OUTPUT_ROOT / "results")
         
     results = {"base": {}, "crf": {}}
@@ -542,110 +693,289 @@ def load_weakly_supervised_results(result_dir=None):
     
     return results
 
+# 添加一个帮助函数，确保掩码是PIL图像
+class MaskToPIL:
+    def __call__(self, mask):
+        """将不同类型的掩码转换为PIL图像"""
+        if isinstance(mask, np.ndarray):
+            return Image.fromarray(mask.astype(np.uint8))
+        elif isinstance(mask, torch.Tensor):
+            return Image.fromarray(mask.numpy().astype(np.uint8))
+        elif isinstance(mask, Image.Image):
+            return mask
+        else:
+            raise TypeError(f"Unexpected mask type: {type(mask)}")
+
+# 添加同步变换的数据集类 - 放在主函数外部以便多进程使用
+class SyncedTransformDataset(FullySupSegDataset):
+    def __getitem__(self, idx):
+        # 防止索引越界
+        if idx >= len(self.image_paths):
+            print(f"Warning: Index {idx} out of bounds, returning dummy sample")
+            return self._get_dummy_sample()
+            
+        try:
+            # 使用字符串路径打开文件
+            img_path = str(self.image_paths[idx])
+            mask_path = str(self.mask_paths[idx])
+            
+            # 确保文件存在
+            if not os.path.exists(img_path) or not os.path.exists(mask_path):
+                print(f"Warning: Files not found at index {idx}, returning dummy sample")
+                return self._get_dummy_sample()
+
+            # 打开图像为RGB模式
+            with Image.open(img_path) as img:
+                # 始终转换为RGB以确保一致性
+                image = img.convert("RGB")
+
+            # 打开掩码为灰度模式
+            with Image.open(mask_path) as mask_img:
+                # 始终转换为L以确保一致性
+                mask_pil = mask_img.convert("L")
+                # 转为numpy以进行处理
+                mask_np = np.array(mask_pil)
+            
+            # 处理trimap值 - 创建二值掩码
+            binary_mask = np.zeros_like(mask_np)
+            binary_mask[mask_np == 1] = 1  # 前景
+            binary_mask[mask_np == 2] = 0  # 背景
+            binary_mask[mask_np == 3] = 255  # 未分类区域
+            
+            # 将numpy掩码转回PIL图像用于变换
+            binary_mask_pil = Image.fromarray(binary_mask.astype(np.uint8))
+            
+            # 同步随机状态
+            random_state = torch.get_rng_state()
+            
+            # 应用图像变换 - 直接在PIL图像上操作
+            if self.transform is not None:
+                try:
+                    image = self.transform(image)
+                except Exception as e:
+                    print(f"Error applying transform to image: {e}")
+                    return self._get_dummy_sample()
+            
+            # 恢复随机状态，确保掩码变换与图像变换使用相同的随机性
+            torch.set_rng_state(random_state)
+            
+            # 应用掩码变换 - 直接在PIL图像上操作
+            if self.mask_transform is not None:
+                try:
+                    mask_tensor = self.mask_transform(binary_mask_pil)
+                except Exception as e:
+                    print(f"Error applying transform to mask: {e}")
+                    return self._get_dummy_sample()
+            else:
+                # 没有变换，直接转为tensor
+                mask_tensor = torch.from_numpy(binary_mask).long()
+
+            # 确保掩码是2D的 [H, W]
+            if mask_tensor.dim() > 2:
+                mask_tensor = mask_tensor.squeeze(0)
+
+            return {"image": image, "mask": mask_tensor, "path": img_path}
+
+        except Exception as e:
+            print(f"Error loading index {idx}: {e}")
+            return self._get_dummy_sample()
+
 def main():
     parser = argparse.ArgumentParser(description='Train segmentation model with fully supervised learning')
     parser.add_argument('--gt_dir', type=str, default=None, help='地址真实标签目录的路径')
-    parser.add_argument('--batch_size', type=int, default=FULLY_SUP_CONFIG["batch_size"], help='批量大小')
-    parser.add_argument('--epochs', type=int, default=FULLY_SUP_CONFIG["num_epochs"], help='训练轮次')
-    parser.add_argument('--lr', type=float, default=FULLY_SUP_CONFIG["learning_rate"], help='学习率')
+    parser.add_argument('--batch_size', type=int, default=FULLY_SUP_CONFIG['batch_size'], help='批量大小')
+    parser.add_argument('--epochs', type=int, default=FULLY_SUP_CONFIG['num_epochs'], help='训练轮次')
+    parser.add_argument('--lr', type=float, default=FULLY_SUP_CONFIG['learning_rate'], help='学习率')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--test_ratio', type=float, default=0.2, help='从test.txt中选取的比例作为测试集')
-    parser.add_argument('--trainval_file', type=str, default=str(DATA_ROOT / 'annotations/trainval.txt'), help='训练集列表文件')
-    parser.add_argument('--test_file', type=str, default=str(DATA_ROOT / 'annotations/test.txt'), help='测试集列表文件')
+    parser.add_argument('--trainval_file', type=str, default=str(ANNOTATION_DIR / 'trainval.txt'), help='训练集列表文件')
+    parser.add_argument('--test_file', type=str, default=str(ANNOTATION_DIR / 'test.txt'), help='测试集列表文件')
+    parser.add_argument('--disable_aug', action='store_true', help='禁用数据增强，只使用基本变换')
+    parser.add_argument('--num_workers', type=int, default=FULLY_SUP_CONFIG['num_workers'], help='数据加载器的工作线程数')
+    parser.add_argument('--single_process', action='store_true', help='禁用多进程数据加载，设置workers=0')
     args = parser.parse_args()
     
     # 设置随机种子
     set_seed(args.seed)
     
-    # 配置
-    config = FULLY_SUP_CONFIG.copy()
-    paths = FULLY_SUP_PATHS.copy()
+    # 更新配置，而不是复制
+    FULLY_SUP_CONFIG['batch_size'] = args.batch_size
+    FULLY_SUP_CONFIG['num_epochs'] = args.epochs
+    FULLY_SUP_CONFIG['learning_rate'] = args.lr
+    FULLY_SUP_CONFIG['weight_decay'] = 1e-4  # 增加权重衰减
     
-    # 更新配置
-    config["batch_size"] = args.batch_size
-    config["num_epochs"] = args.epochs
-    config["learning_rate"] = args.lr
+    # 如果使用单进程模式，设置workers=0
+    if args.single_process:
+        FULLY_SUP_CONFIG['num_workers'] = 0
+        print("使用单进程数据加载(num_workers=0)")
+    else:
+        FULLY_SUP_CONFIG['num_workers'] = args.num_workers
+        print(f"使用多进程数据加载(num_workers={args.num_workers})")
     
     # 如果提供了自定义真实标签目录，则更新路径
     if args.gt_dir:
-        paths["mask_dir"] = args.gt_dir
+        FULLY_SUP_PATHS['mask_dir'] = args.gt_dir
     
     # 检查真实标签目录是否存在
-    if not os.path.exists(paths["mask_dir"]):
-        print(f"Error: Ground truth mask directory does not exist {paths['mask_dir']}")
+    if not os.path.exists(FULLY_SUP_PATHS['mask_dir']):
+        print(f"Error: Ground truth mask directory does not exist {FULLY_SUP_PATHS['mask_dir']}")
         print(f"Please prepare ground truth data first or specify the correct directory with --gt_dir")
         return
     
-    # 数据变换
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.Resize(config["image_size"])
-    ])
+    # 决定是否使用增强的数据变换
+    if args.disable_aug:
+        print("\n===== Using basic transforms (no augmentation) =====")
+        # 基本变换 - 只进行归一化和调整大小
+        transform = transforms.Compose([
+            transforms.Resize(FULLY_SUP_CONFIG["image_size"]),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        # 基本掩码变换
+        mask_transform = transforms.Compose([
+            transforms.Resize(
+                FULLY_SUP_CONFIG["image_size"],
+                interpolation=transforms.InterpolationMode.NEAREST
+            ),
+            BinaryMaskToTensor()
+        ])
+    else:
+        print("\n===== Using enhanced transforms with augmentation =====")
+        # 创建共享的随机状态，确保图像和掩码应用相同的随机变换
+        # 这些种子不会影响训练过程的随机性，只用于确保变换一致
+        tf_seed = random.randint(0, 2**32 - 1)
+        flip_seed = random.randint(0, 2**32 - 1)
+        crop_seed = random.randint(0, 2**32 - 1)
+        rotate_seed = random.randint(0, 2**32 - 1)
+        affine_seed = random.randint(0, 2**32 - 1)
+        print(f"Transform random seeds: flip={flip_seed}, crop={crop_seed}, rotate={rotate_seed}, affine={affine_seed}")
+        
+        # 增强的数据变换 - 使用同步的随机性
+        transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.Resize((256, 256)),  # 先调整大小，再裁剪
+            transforms.RandomResizedCrop(
+                size=FULLY_SUP_CONFIG["image_size"], 
+                scale=(0.7, 1.0)  # 使用更大的下限，确保不会裁剪掉太多内容
+            ),
+            transforms.ColorJitter(
+                brightness=0.2, 
+                contrast=0.2, 
+                saturation=0.2, 
+                hue=0.1
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        # 掩码变换 - 需要与图像变换一致，但不应用色彩变换
+        mask_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.NEAREST),  # 先调整大小，再裁剪
+            transforms.RandomResizedCrop(
+                size=FULLY_SUP_CONFIG["image_size"], 
+                scale=(0.7, 1.0),  # 与图像相同的参数
+                interpolation=transforms.InterpolationMode.NEAREST
+            ),
+            BinaryMaskToTensor()
+        ])
     
-    mask_transform = transforms.Compose([
-        BinaryMaskToTensor(),
-        MaskResize(config["image_size"])
-    ])
-    
-    # 使用官方数据集划分，从test.txt中选择一部分作为测试集
+    # 使用官方数据集划分，使用全部test.txt作为测试集
     print("\n===== 加载官方数据集划分 =====")
     train_images, test_images = load_official_dataset_split(
         trainval_file=args.trainval_file,
         test_file=args.test_file,
-        test_ratio=args.test_ratio,
+        test_ratio=args.test_ratio,  # 使用全部test.txt文件
         seed=args.seed
     )
     
     # 创建全监督数据集
     print("\n===== Creating Fully Supervised Dataset =====")
+    
     # 创建训练集 - 使用真实标签
-    train_dataset = FullySupSegDataset(
-        paths["img_dir"], 
-        paths["mask_dir"], 
+    train_dataset = SyncedTransformDataset(
+        FULLY_SUP_PATHS["img_dir"], 
+        FULLY_SUP_PATHS["mask_dir"], 
         transform, 
         mask_transform,
         image_list=train_images  # 只使用训练集图像
     )
     
     # 创建测试集 - 使用真实标签
-    test_dataset = FullySupSegDataset(
-        paths["img_dir"], 
-        paths["mask_dir"], 
-        transform, 
-        mask_transform,
+    test_dataset = SyncedTransformDataset(
+        FULLY_SUP_PATHS["img_dir"], 
+        FULLY_SUP_PATHS["mask_dir"], 
+        # 测试集只需要基本变换，不需要数据增强
+        transforms.Compose([
+            transforms.Resize(FULLY_SUP_CONFIG["image_size"]),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]), 
+        transforms.Compose([
+            transforms.Resize(FULLY_SUP_CONFIG["image_size"], interpolation=transforms.InterpolationMode.NEAREST),
+            BinaryMaskToTensor()
+        ]),
         image_list=test_images  # 只使用测试集图像
     )
     
+    # 创建数据加载器
+    print(f"\n创建数据加载器: 批量大小={FULLY_SUP_CONFIG['batch_size']}, 工作线程数={FULLY_SUP_CONFIG['num_workers']}")
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=config["batch_size"], 
+        batch_size=FULLY_SUP_CONFIG["batch_size"], 
         shuffle=True, 
-        num_workers=config["num_workers"]
+        num_workers=FULLY_SUP_CONFIG["num_workers"],
+        pin_memory=True if torch.cuda.is_available() else False,
+        persistent_workers=True if FULLY_SUP_CONFIG["num_workers"] > 0 else False,
+        prefetch_factor=2 if FULLY_SUP_CONFIG["num_workers"] > 0 else None
     )
     
     test_loader = DataLoader(
         test_dataset, 
-        batch_size=config["batch_size"], 
+        batch_size=FULLY_SUP_CONFIG["batch_size"], 
         shuffle=False, 
-        num_workers=config["num_workers"]
+        num_workers=FULLY_SUP_CONFIG["num_workers"],
+        pin_memory=True if torch.cuda.is_available() else False,
+        persistent_workers=True if FULLY_SUP_CONFIG["num_workers"] > 0 else False,
+        prefetch_factor=2 if FULLY_SUP_CONFIG["num_workers"] > 0 else None
     )
     
     # 创建模型、损失函数和优化器
     print("\n===== Training Fully Supervised Model =====")
     model = DeepLabLargeFOV(
-        num_classes=config["num_classes"], 
-        atrous_rates=config["atrous_rates"]
-    )
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=config["learning_rate"], 
-        weight_decay=config["weight_decay"]
+        num_classes=FULLY_SUP_CONFIG["num_classes"], 
+        atrous_rates=FULLY_SUP_CONFIG["atrous_rates"]
     )
     
+    # 使用带忽略索引的交叉熵损失
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
+    
+    # 使用AdamW优化器，更合适的权重衰减
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=FULLY_SUP_CONFIG["learning_rate"], 
+        weight_decay=FULLY_SUP_CONFIG["weight_decay"]
+    )
+    
+    # 添加学习率调度器 - 使用StepLR
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, 
+        step_size=20, 
+        gamma=0.5
+    )
+    
+    # 添加scheduler到config中
+    FULLY_SUP_CONFIG["scheduler"] = scheduler
+    
     # 训练模型
-    model, log = train_model(model, train_loader, test_loader, criterion, optimizer, config, paths, "fully_supervised")
+    model, log = train_model(model, train_loader, test_loader, criterion, optimizer, FULLY_SUP_CONFIG, FULLY_SUP_PATHS, "fully_supervised")
     
     print("\n===== Fully Supervised Training Complete =====")
     print(f"Results:")
@@ -656,20 +986,30 @@ def main():
     # 找出最佳模型对应的epoch
     best_epoch_idx = log['test_miou'].index(log['best_miou'])
     best_train_miou = log['train_miou'][best_epoch_idx]
+    best_val_miou = log['val_miou'][best_epoch_idx]
     best_test_miou = log['best_miou']
+    best_class_ious = log['test_class_ious'][best_epoch_idx]
     
     # 保存最佳模型的mIoU结果到CSV文件
-    best_results_file = os.path.join(paths["result_dir"], f"best_model_results.csv")
+    best_results_file = os.path.join(FULLY_SUP_PATHS["result_dir"], f"best_model_results.csv")
     os.makedirs(os.path.dirname(best_results_file), exist_ok=True)
     
     with open(best_results_file, 'w') as f:
         f.write("Metric,Value\n")
         f.write(f"Best_Train_mIoU,{best_train_miou:.4f}\n")
+        f.write(f"Best_Val_mIoU,{best_val_miou:.4f}\n")
         f.write(f"Best_Test_mIoU,{best_test_miou:.4f}\n")
+        class_names = ["背景", "前景"]
+        for i, class_iou in enumerate(best_class_ious):
+            f.write(f"Class_{class_names[i]}_IoU,{class_iou:.4f}\n")
     
     print(f"\n最佳模型结果已保存到: {best_results_file}")
     print(f"最佳模型训练mIoU: {best_train_miou:.4f}")
+    print(f"最佳模型验证mIoU: {best_val_miou:.4f}")
     print(f"最佳模型测试mIoU: {best_test_miou:.4f}")
+    print(f"最佳模型类别IoU:")
+    for i, class_iou in enumerate(best_class_ious):
+        print(f"  - {class_names[i]}: {class_iou:.4f}")
     
     # 比较函数 - 可用于将完全监督与弱监督方法进行比较
     def compare_with_weakly_supervised(fully_supervised_miou, weakly_supervised_miou):
