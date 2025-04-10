@@ -1,2 +1,2 @@
-scikit-learn==1.3.0
 pydensecrf @ git+https://github.com/lucasb-eyer/pydensecrf.git@master
+pip install scikit-image

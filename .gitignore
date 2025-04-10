@@ -6,6 +6,7 @@ DL/data/temp/*
 DL/outputs/pseudo_masks/*
 DL/outputs/cams/*
 DL/outputs/base_pseudo/*
+DL/outputs/vis_pseudo/*
 DL/outputs/results/*
 DL/models/segmentor/*
 DL/models/segmentor/fully_supervised/*
@@ -18,9 +19,12 @@ DL/生成数据.zip
 !DL/outputs/pseudo_masks/.gitkeep
 !DL/outputs/cams/.gitkeep
 !DL/outputs/base_pseudo/.gitkeep
+!DL/outputs/vis_pseudo/.gitkeep
 !DL/models/classifier/.gitkeep
 !DL/models/segmentor/.gitkeep
 !DL/models/segmentor/fully_supervised/
 !DL/models/segmentor/fully_supervised/.gitkeep
 
 *.zip
+DL/models/classifier/*.pth
+DL/models/classifier/*.pth
